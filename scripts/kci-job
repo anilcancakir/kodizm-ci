@@ -644,13 +644,19 @@ run_test() {
             fi
             args+=(--compact --filter RuleFileClassReferencesTest)
             ;;
-        affected | full)
+        affected)
+            # A filtered run is small, and split across shards most shards
+            # match nothing, which PHPUnit exits 1 on. Shard 1 runs it whole.
+            if [ "$shard" -ne 1 ]; then
+                status=skipped
+                return 0
+            fi
+            args=(artisan test --parallel --processes=4 --compact --filter "$filter")
+            ;;
+        full)
             args=(artisan test --parallel --processes=4 --compact)
             if [ "$shards" -gt 1 ]; then
                 args+=("--shard=$shard/$shards" --shard-test-distribution=sequential)
-            fi
-            if [ "$php" = affected ]; then
-                args+=(--filter "$filter")
             fi
             ;;
     esac
