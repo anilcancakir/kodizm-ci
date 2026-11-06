@@ -1,0 +1,153 @@
+name: CI
+
+# Dispatched by kodizm.com only. ci_run_id is an opaque id: it names nothing,
+# and kci-job rejects anything but a lowercase UUID. Everything private (the
+# source, the commits, the scope) arrives at runtime through the OIDC token
+# exchange inside kci-job and never touches this file, the run name or the log.
+# The image is pinned by digest so a push to a mutable tag cannot change what
+# runs with id-token: write; a new image is adopted by editing the digest here.
+run-name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Opaque run id
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/kodizm/kodizm-ci@sha256:fb4d072290ab0364bba0c699f493a622f8748de2be836775046559c5d4b473e3
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    steps:
+      - name: Prepare
+        id: prepare
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: lint
+        run: kci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: kci-
+      - name: Run
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: lint
+        run: kci-job run
+
+  gateway:
+    name: gateway
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/kodizm/kodizm-ci@sha256:fb4d072290ab0364bba0c699f493a622f8748de2be836775046559c5d4b473e3
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    steps:
+      - name: Prepare
+        id: prepare
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: gateway
+        run: kci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: kci-
+      - name: Run
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: gateway
+        run: kci-job run
+
+  # Starts in pr mode too: kci-job reports it skipped there. Only a main run
+  # writes the cache, so pull request code can never seed it.
+  warm:
+    name: warm
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/kodizm/kodizm-ci@sha256:fb4d072290ab0364bba0c699f493a622f8748de2be836775046559c5d4b473e3
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    steps:
+      - name: Prepare
+        id: prepare
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: warm
+        run: kci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: kci-
+      - name: Run
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: warm
+        run: kci-job run
+      - name: Save dependency cache
+        if: steps.prepare.outputs.mode == 'main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+
+  test:
+    name: test (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    # Below kodizm.com's 30-minute run timeout, which counts from the claim
+    # and so includes queueing; a job still allowed to run is never reaped.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+          - 4
+    container:
+      image: ghcr.io/kodizm/kodizm-ci@sha256:fb4d072290ab0364bba0c699f493a622f8748de2be836775046559c5d4b473e3
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    steps:
+      - name: Prepare
+        id: prepare
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: test (${{ matrix.shard }})
+        run: kci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: kci-
+      - name: Run
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: test (${{ matrix.shard }})
+        run: kci-job run
