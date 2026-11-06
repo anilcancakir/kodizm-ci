@@ -31,6 +31,9 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
     steps:
       - name: Prepare
         id: prepare
@@ -59,6 +62,9 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
     steps:
       - name: Prepare
         id: prepare
@@ -89,6 +95,9 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
     steps:
       - name: Prepare
         id: prepare
@@ -133,6 +142,9 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
     steps:
       - name: Prepare
         id: prepare
