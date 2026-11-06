@@ -5,19 +5,25 @@
 # account (uid 2000) with setpriv before they touch anything that came from a pull request.
 # php-cli is here only for the root-side summariser inside kci-job; the Flutter suites never
 # run PHP.
-FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
+#
+# trixie, not bookworm: icon checks (uptizm bin/sync-icons --check) compare librsvg renders with
+# committed PNGs, and bookworm's librsvg 2.54 draws feDropShadow differently enough to move up to
+# 9% of the pixels; trixie's 2.60 matches what the repositories commit.
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 # git, curl, unzip and xz-utils are what the Flutter tool and actions/checkout need; util-linux
-# brings setpriv and procps brings pkill, both used by the sandbox scripts. No sudo: nothing in
-# a job may regain root.
+# brings setpriv and procps brings pkill, both used by the sandbox scripts. librsvg2-bin and
+# python3-pil are the icon renderer and comparer. No sudo: nothing in a job may regain root.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
         jq \
+        librsvg2-bin \
         php-cli \
         procps \
         python3 \
+        python3-pil \
         unzip \
         util-linux \
         xz-utils \
