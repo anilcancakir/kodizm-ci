@@ -42,12 +42,13 @@ RUN useradd -u 2000 -m -s /bin/bash ci
 # lockfile and checks its stamps at run time, belongs to `ci`. The tool snapshot, the version file
 # and the artifacts are all made here at build time, so a job neither rebuilds the tool nor
 # downloads an engine. The safe.directory entry lets `ci` run git in the root-owned SDK checkout,
-# which the tool does to learn its own revision.
+# which the tool does to learn its own revision. Everything is made readable to `ci`: pub writes the
+# tool's package_config.json 0600, and `flutter create` reads it.
 RUN git config --system --add safe.directory /opt/flutter \
     && /opt/flutter/bin/flutter config --no-analytics \
     && /opt/flutter/bin/flutter --version \
     && /opt/flutter/bin/flutter precache --no-android --no-ios \
-    && chmod -R go-w /opt/flutter \
+    && chmod -R go-w,a+rX /opt/flutter \
     && chown -R ci:ci /opt/flutter/bin/cache
 
 # Explicit glob, not the whole directory: scripts/test holds the harness tests and must not ship.
