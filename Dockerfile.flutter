@@ -15,9 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         git \
         jq \
+        librsvg2-bin \
         php-cli \
         procps \
         python3 \
+        python3-pil \
         unzip \
         util-linux \
         xz-utils \
