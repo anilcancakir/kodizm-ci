@@ -364,19 +364,26 @@ exchange_token() {
     rm -f "$secret/oidc-token.curl"
 
     # Every value below lands in a path, a URL or a curl config, so its shape
-    # is checked before use.
-    if ! jq -e '
-        (.token | type == "string" and test("^[A-Za-z0-9_]+$"))
-        and (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
-        and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
-        and (.base_sha == null or (.base_sha | type == "string" and test("^([0-9a-f]{40})?$")))
-        and (.mode | IN("pr", "main"))
-        and (.role | IN("lint", "gateway", "warm", "test"))
-        and (.shards | type == "number" and . >= 1 and . == floor)
-        and (.shard | type == "number" and . >= 1 and . == floor)
-        and .shard <= .shards
-    ' "$secret/token.json" >/dev/null; then
-        say 'the token response has an unexpected shape'
+    # is checked before use. The token allows dots and dashes: GitHub's
+    # stateless installation tokens carry a JWT after the ghs_ prefix. Only
+    # the names of failing fields reach the public log, never a value.
+    local bad
+    bad="$(jq -r '
+        . as $r
+        | [
+            (if (.token | type == "string" and test("^[A-Za-z0-9._-]+$")) then empty else "token" end),
+            (if (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")) then empty else "repository" end),
+            (if (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) then empty else "head_sha" end),
+            (if (.base_sha == null or (.base_sha | type == "string" and test("^([0-9a-f]{40})?$"))) then empty else "base_sha" end),
+            (if (.mode | IN("pr", "main")) then empty else "mode" end),
+            (if (.role | IN("lint", "gateway", "warm", "test")) then empty else "role" end),
+            (if (.shards | type == "number" and . >= 1 and . == floor) then empty else "shards" end),
+            (if (.shard | type == "number" and . >= 1 and . == floor and . <= ($r.shards // 0)) then empty else "shard" end)
+        ] | join(",")
+    ' "$secret/token.json")"
+
+    if [ -n "$bad" ]; then
+        say "the token response has an unexpected shape ($bad)"
         return 1
     fi
 
