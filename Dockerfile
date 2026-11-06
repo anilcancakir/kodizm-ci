@@ -3,7 +3,8 @@
 # Same interpreter and extension set as the self-hosted runner image so a
 # pipeline behaves identically on both, minus everything that exists only for
 # the actions runner itself (the runner tarball, its user, sudo) and for the
-# other repositories that share that image (Flutter, PostgreSQL server).
+# other repositories that share that image (Flutter). The PostgreSQL server
+# binaries stay, for suites that run against a real database.
 #
 # Actions starts a container job as the image's default user and needs root
 # there to mount its workspace, so there is deliberately no USER directive.
@@ -67,6 +68,16 @@ RUN curl -fsSLo /tmp/go.tar.gz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.ta
     && tar -C /usr/local -xzf /tmp/go.tar.gz \
     && rm /tmp/go.tar.gz
 
+# Server binaries only: a job runs initdb and pg_ctl as `ci` against a data
+# directory of its own. The distribution's cluster is switched off before the
+# server package is configured, so no cluster exists and no service starts at
+# build time. The base (trixie) ships major 17; the binaries live outside PATH.
+ARG PG_MAJOR=17
+RUN apt-get update && apt-get install -y --no-install-recommends postgresql-common \
+    && echo 'create_main_cluster = false' >> /etc/postgresql-common/createcluster.conf \
+    && apt-get install -y --no-install-recommends "postgresql-${PG_MAJOR}" \
+    && rm -rf /var/lib/apt/lists/*
+
 # A fresh HOME is created per run by kci-sandbox; the account exists so setpriv
 # has a stable uid to drop to.
 RUN useradd -u 2000 -m -s /bin/bash ci
@@ -76,4 +87,4 @@ RUN useradd -u 2000 -m -s /bin/bash ci
 # cannot rewrite the code that sandboxes it.
 COPY --chmod=0755 scripts/kci-* /opt/kci/
 
-ENV PATH=/opt/kci:/usr/local/go/bin:${PATH}
+ENV PATH=/opt/kci:/usr/local/go/bin:/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}

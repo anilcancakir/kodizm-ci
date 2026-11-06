@@ -3,7 +3,8 @@ name: Isolation probe
 # Proves on a real hosted runner what kci-sandbox promises: code running as
 # uid 2000 cannot read a secret root holds, cannot write the runner's file
 # commands or step summary, cannot reach the runner's workflow command parser,
-# and leaves no process behind. The public log shows only the secret's sha256
+# and leaves no process behind, not even one a sandboxed PostgreSQL server
+# started (COPY TO PROGRAM). The public log shows only the secret's sha256
 # and one line per check; the probe's own output stays in a root-only file.
 on:
   workflow_dispatch:
@@ -131,6 +132,57 @@ jobs:
           #    are not counted).
           live="$(ps -A -o uid=,stat= | awk '$1 == 2000 && $2 !~ /^Z/ { n++ } END { print n + 0 }')"
           echo "probe: live uid 2000 processes after the sandbox: $live"
+          if [ "$live" -ne 0 ]; then
+            failed=true
+          fi
+
+          if [ "$failed" = true ]; then
+            echo 'probe: FAILED'
+            exit 1
+          fi
+          echo 'probe: passed'
+
+      # Skipped on an expect_fail run, whose first step fails by design: the
+      # reap below would otherwise kill the daemon that run keeps on purpose.
+      - name: Probe Postgres and the reap
+        run: |
+          failed=false
+          report=/kciprobe/out/postgres-report
+
+          # 1. The same --postgres wrapper run.yml's test jobs use: initdb,
+          #    pg_ctl and a query as uid 2000. --keep leaves the server and the
+          #    program COPY TO PROGRAM started, as a hostile test would.
+          postgres_status=0
+          kci-sandbox --keep --postgres /kciprobe/log/postgres.log /kciprobe/out \
+            -- kci-probe --postgres "$report" || postgres_status=$?
+          echo "probe: kci-sandbox --postgres exited $postgres_status"
+          if [ "$postgres_status" -ne 0 ]; then
+            failed=true
+          fi
+
+          for check in postgres_select copy_program; do
+            if grep -qx "$check=ok" "$report"; then
+              echo "probe: $check ok"
+            else
+              echo "probe: $check NOT ok"
+              failed=true
+            fi
+          done
+
+          # 2. The program has to be alive now, or the reap proves nothing.
+          if pgrep -u 2000 -f kciprobe-copy-program >/dev/null; then
+            echo 'probe: the COPY TO PROGRAM child outlived its session'
+          else
+            echo 'probe: the COPY TO PROGRAM child is not running'
+            failed=true
+          fi
+
+          # 3. The reap every kci-job phase ends with must leave nothing alive.
+          if ! kci-sandbox --reap; then
+            failed=true
+          fi
+          live="$(ps -A -o uid=,stat= | awk '$1 == 2000 && $2 !~ /^Z/ { n++ } END { print n + 0 }')"
+          echo "probe: live uid 2000 processes after the reap: $live"
           if [ "$live" -ne 0 ]; then
             failed=true
           fi

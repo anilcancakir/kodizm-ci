@@ -3,25 +3,36 @@
 #
 # usage: kci-job prepare | run
 #
-# prepare  trades an OIDC token (aud kodizm-ci-token) for the job's facts and a
-#          short-lived installation token, fetches the private head and base
-#          commits with it, revokes it, lets the repository's own ci-scope.sh
-#          decide the scope (as uid 2000), removes .git, and writes cache_key
-#          and mode to $GITHUB_OUTPUT. run.yml then restores the dependency
-#          cache into /kci/cache, before any pull request code has run.
-# run      installs dependencies and runs the role command as uid 2000 through
-#          kci-sandbox, kills every uid 2000 process, and only then fetches a
-#          fresh OIDC token (aud kodizm-ci-results) to post the results. It
-#          posts on a failed command (status failed) and on an internal error
-#          (status errored) too.
+# prepare  trades an OIDC token (aud kodizm-ci-token) for the job's facts, the
+#          repository's manifest block for this job's stack and a short-lived
+#          installation token, fetches the private head and base commits with
+#          it, revokes it, resolves the manifest's directory, lets the
+#          repository's own scope script decide the scope (as uid 2000),
+#          removes .git, and writes cache_key, cache_scope and mode to
+#          $GITHUB_OUTPUT. run.yml then restores the dependency cache into
+#          /kci/cache, before any pull request code has run.
+# run      installs dependencies and runs the role's manifest commands as uid
+#          2000 through kci-sandbox, kills every uid 2000 process, and only then
+#          fetches a fresh OIDC token (aud kodizm-ci-results) to post the
+#          results. It posts on a failed command (status failed) and on an
+#          internal error (status errored) too.
 #
-# Environment: KCI_RUN_ID (lowercase UUID), KCI_JOB_NAME (`lint`, `test (2)`),
-# KCI_API (default https://kodizm.com) and the runner's
+# Environment: KCI_RUN_ID (lowercase UUID), KCI_JOB_NAME (`lint`, `test (2)`,
+# `flutter-test (1)`), KCI_API (default https://kodizm.com) and the runner's
 # ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN (job permission id-token: write).
 #
-# The public log gets fixed `kci:` lines only. Every command's own output goes
-# to root-only logs under /kci/state, because an error message (git's, jq's)
-# can quote the private repository name or a token. No secret is ever an
+# The manifest and the cache namespace come from the token response only,
+# never from the checkout. Every manifest command runs as `bash -c` under
+# kci-sandbox in the manifest's directory with KCI_REPORT_DIR (a uid 2000
+# directory for junit.xml, pint.json or flutter.json), KCI_SHARD and
+# KCI_SHARDS (test roles), KCI_SCOPE_PHP and KCI_SCOPE_FILTER (laravel with a
+# scope script) and KCI_CHANGED_FILES (a file of repository-relative paths
+# changed since the scope's pint_base; unset when everything is checked).
+#
+# The public log gets fixed `kci:` lines only, never a manifest command, a
+# directory or a repository name. Every command's own output goes to
+# root-only logs under /kci/state, because an error message (git's, jq's) can
+# quote the private repository name or a token. No secret is ever an
 # argument: curl reads headers from 0600 config files, git reads the token
 # through GIT_ASKPASS.
 #
@@ -36,44 +47,16 @@ secret="$root/secret"
 tree="$root/tree"
 out="$root/out"
 cache="$root/cache"
+changed_files="$root/changed-files"
 sandbox_uid=2000
 api="${KCI_API:-https://kodizm.com}"
 api="${api%/}"
 
-phase="${1:-}"
+phase=''
 status=errored
 last_log=''
 reporting=false
 sandbox_env=()
-
-case "$phase" in
-    prepare | run) ;;
-    *)
-        echo 'usage: kci-job prepare | run' >&2
-        exit 2
-        ;;
-esac
-
-# The run id reaches a URL body and the token exchange, so it is checked
-# before anything touches the network.
-if ! [[ "${KCI_RUN_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-    echo 'kci: KCI_RUN_ID is not a lowercase UUID' >&2
-    exit 2
-fi
-
-if [ -z "${KCI_JOB_NAME:-}" ]; then
-    echo 'kci: KCI_JOB_NAME is empty' >&2
-    exit 2
-fi
-
-umask 077
-install -d -m 0711 "$root"
-install -d -m 0700 "$state" "$secret"
-
-# fd 3 is the public log; stdout and stderr of everything else go private.
-# kci-sandbox closes fd 3 before it drops privileges.
-exec 3>&1
-exec >>"$state/$phase.log" 2>&1
 
 say() {
     printf 'kci: %s\n' "$1" >&3
@@ -83,14 +66,61 @@ http_status() {
     cat "$1.status" 2>/dev/null || echo 000
 }
 
-# usage: sandboxed <log-name> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+# usage: sandboxed [--postgres] <log-name> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
 sandboxed() {
+    local flags=()
+
+    if [ "$1" = --postgres ]; then
+        flags=(--postgres)
+        shift
+    fi
+
     local name="$1"
     local workdir="$2"
     shift 2
 
     last_log="$name"
-    kci-sandbox "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@"
+    kci-sandbox "${flags[@]}" "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@"
+}
+
+# Prints the real path of <dir> inside <tree>, or fails for an absolute path,
+# a `..` component, a symlink at any component, anything but a directory, and
+# whatever realpath places outside <tree>. The manifest names <dir> and the
+# checkout is pull request code, so both are untrusted.
+resolve_dir() {
+    local tree_root="$1"
+    local dir="$2"
+    local path
+    local component
+    local components=()
+    local resolved
+
+    if ! [[ "$dir" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$dir" == /* ]]; then
+        return 1
+    fi
+
+    tree_root="$(realpath "$tree_root")" || return 1
+    path="$tree_root"
+
+    IFS=/ read -r -a components <<<"$dir"
+    for component in "${components[@]}"; do
+        case "$component" in
+            '' | .) continue ;;
+            ..) return 1 ;;
+        esac
+
+        path="$path/$component"
+        if [ -L "$path" ] || [ ! -d "$path" ]; then
+            return 1
+        fi
+    done
+
+    resolved="$(realpath "$path")" || return 1
+    if [ "$resolved" != "$tree_root" ] && [[ "$resolved" != "$tree_root"/* ]]; then
+        return 1
+    fi
+
+    printf '%s\n' "$resolved"
 }
 
 # Writes a curl config carrying a fresh OIDC token for <audience>. The runner's
@@ -146,9 +176,10 @@ write_empty_summary() {
         >"$state/summary.json"
 }
 
-# Turns a JUnit XML or Pint JSON file into {counts, failures, annotations}.
-# The file came out of the sandbox, so it is parsed as data only: no network,
-# no entity expansion beyond libxml's defaults, invalid UTF-8 substituted.
+# Turns a JUnit XML, Pint JSON or Flutter JSON reporter file into {counts,
+# failures, annotations}. The file came out of the sandbox, so it is parsed as
+# data only: no network, no entity expansion beyond libxml's defaults, invalid
+# UTF-8 substituted. The flutter image ships PHP 8.2, so nothing newer is used.
 summarise() {
     php -d memory_limit=1G -- "$1" "$2" "$tree/" >"$state/summary.json" <<'PHP'
 <?php
@@ -217,6 +248,72 @@ if ($kind === 'pint') {
     }
 }
 
+// One JSON event per line. A test is counted at its testDone; a hidden test
+// (the synthetic "loading <file>" one) counts only when it did not pass,
+// which is how a compile error shows up. The location prefers root_url and
+// root_line, the declaration inside the test file itself.
+if ($kind === 'flutter') {
+    $handle = fopen($file, 'rb');
+
+    if ($handle === false) {
+        exit(1);
+    }
+
+    $suites = [];
+    $tests = [];
+    $errors = [];
+    $path = static fn (mixed $url): string => $relative(rawurldecode(preg_replace('#^file://#', '', (string) $url)));
+
+    while (($line = fgets($handle)) !== false) {
+        $event = json_decode($line, true, 64);
+
+        if (! is_array($event)) {
+            continue;
+        }
+
+        $type = $event['type'] ?? null;
+
+        if ($type === 'suite') {
+            $suites[(int) ($event['suite']['id'] ?? -1)] = (string) ($event['suite']['path'] ?? '');
+        } elseif ($type === 'testStart') {
+            $test = (array) ($event['test'] ?? []);
+            $url = $test['root_url'] ?? $test['url'] ?? $suites[(int) ($test['suiteID'] ?? -1)] ?? '';
+            $tests[(int) ($test['id'] ?? -1)] = [
+                'file' => $path($url),
+                'line' => (int) ($test['root_line'] ?? $test['line'] ?? 0),
+                'name' => str_replace($prefix, '', (string) ($test['name'] ?? '')),
+            ];
+        } elseif ($type === 'error') {
+            $errors[(int) ($event['testID'] ?? -1)][] = trim(
+                ((string) ($event['error'] ?? ''))."\n".((string) ($event['stackTrace'] ?? '')),
+            );
+        } elseif ($type === 'testDone') {
+            $id = (int) ($event['testID'] ?? -1);
+            $result = (string) ($event['result'] ?? 'success');
+
+            if (($event['hidden'] ?? false) === true && $result === 'success') {
+                continue;
+            }
+
+            $summary['counts']['tests']++;
+            $test = $tests[$id] ?? ['file' => '', 'line' => 0, 'name' => ''];
+            $message = implode("\n\n", $errors[$id] ?? []);
+
+            if (($event['skipped'] ?? false) === true) {
+                $summary['counts']['skipped']++;
+            } elseif ($result === 'failure') {
+                $summary['counts']['failures']++;
+                $fail($test['file'], $test['line'], $test['name'], $message);
+            } elseif ($result === 'error') {
+                $summary['counts']['errors']++;
+                $fail($test['file'], $test['line'], $test['name'], $message);
+            }
+        }
+    }
+
+    fclose($handle);
+}
+
 echo json_encode($summary, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
 PHP
 }
@@ -238,6 +335,24 @@ collect() {
     if ! summarise "$kind" "$copy"; then
         write_empty_summary
     fi
+}
+
+# Summarises the first report a command left in KCI_REPORT_DIR. The existence
+# test only stats the name; collect does the reading.
+collect_report() {
+    local report
+    local kind
+    local name
+
+    for report in junit:junit.xml pint:pint.json flutter:flutter.json; do
+        kind="${report%%:*}"
+        name="${report#*:}"
+
+        if [ -e "$out/$name" ] || [ -L "$out/$name" ]; then
+            collect "$kind" "$name"
+            return 0
+        fi
+    done
 }
 
 # Fits the payload into 512 KB: the full caps first (200 failures, 2000
@@ -344,8 +459,6 @@ on_error() {
     exit 1
 }
 
-trap 'on_error "$LINENO"' ERR
-
 # ---------------------------------------------------------------------------
 # prepare
 # ---------------------------------------------------------------------------
@@ -363,12 +476,38 @@ exchange_token() {
     fi
     rm -f "$secret/oidc-token.curl"
 
-    # Every value below lands in a path, a URL or a curl config, so its shape
-    # is checked before use. The token allows dots and dashes: GitHub's
-    # stateless installation tokens carry a JWT after the ghs_ prefix. Only
-    # the names of failing fields reach the public log, never a value.
+    # Every value below lands in a path, a URL, a curl config or a sandboxed
+    # shell, so its shape is checked before use. The token allows dots and
+    # dashes: GitHub's stateless installation tokens carry a JWT after the
+    # ghs_ prefix. The manifest is the repository's own file, relayed by
+    # kodizm.com, so it is checked here too. Only the names of failing fields
+    # reach the public log, never a value.
     local bad
     bad="$(jq -r '
+        def relative_path:
+            type == "string"
+            and test("^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
+            and (split("/") | all(. != "." and . != ".."));
+        def shell_text: type == "string" and length > 0 and all(explode[]; . != 0);
+        def commands: type == "array" and all(.[]; shell_text);
+        def optional(check): . == null or check;
+        def laravel_block:
+            (.dir == "." or (.dir | relative_path))
+            and (.setup | commands)
+            and (.lint | commands)
+            and (.aux | optional(commands))
+            and (.services | optional(type == "array" and all(.[]; . == "postgres")))
+            and (.scope_script | optional(relative_path))
+            and (.test | type == "object")
+            and (.test.shards | type == "number" and . >= 1 and . <= 4 and . == floor)
+            and (.test.filter_script | optional(relative_path));
+        def flutter_block:
+            (.dir == "." or (.dir | relative_path))
+            and (.setup | commands)
+            and (.lint | commands)
+            and (.test | type == "object")
+            and (.test.shards | type == "number" and . >= 1 and . <= 4 and . == floor)
+            and (.test.command | optional(shell_text));
         . as $r
         | [
             (if (.token | type == "string" and test("^[A-Za-z0-9._-]+$")) then empty else "token" end),
@@ -376,9 +515,19 @@ exchange_token() {
             (if (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) then empty else "head_sha" end),
             (if (.base_sha == null or (.base_sha | type == "string" and test("^([0-9a-f]{40})?$"))) then empty else "base_sha" end),
             (if (.mode | IN("pr", "main")) then empty else "mode" end),
-            (if (.role | IN("lint", "gateway", "warm", "test")) then empty else "role" end),
+            (if (.role | IN("lint", "aux", "warm", "test", "flutter-lint", "flutter-warm", "flutter-test")) then empty else "role" end),
             (if (.shards | type == "number" and . >= 1 and . == floor) then empty else "shards" end),
-            (if (.shard | type == "number" and . >= 1 and . == floor and . <= ($r.shards // 0)) then empty else "shard" end)
+            (if (.shard | type == "number" and . >= 1 and . == floor and . <= ($r.shards // 0)) then empty else "shard" end),
+            (if (.stack | IN("laravel", "flutter")) and ((.role | tostring | startswith("flutter-")) == (.stack == "flutter"))
+                then empty else "stack" end),
+            (if (.cache_namespace | type == "string" and test("^[0-9a-f]{16}$")) then empty else "cache_namespace" end),
+            (if (try (
+                (.manifest | type == "object")
+                and .manifest.version == 1
+                and (.manifest.stacks | type == "object")
+                and (.manifest.stacks | keys) == [$r.stack]
+                and (.manifest.stacks[$r.stack] | if $r.stack == "laravel" then laravel_block else flutter_block end)
+            ) catch false) then empty else "manifest" end)
         ] | join(",")
     ' "$secret/token.json")"
 
@@ -394,12 +543,19 @@ exchange_token() {
         "header = \"X-GitHub-Api-Version: 2022-11-28\""
     ' "$secret/token.json" >"$secret/github.curl"
 
+    # The stack's manifest block is all run needs of the manifest; it stays
+    # root-only beside the logs.
+    jq '.manifest.stacks[.stack]' "$secret/token.json" >"$state/stack.json"
+
     mode="$(jq -r '.mode' "$secret/token.json")"
     role="$(jq -r '.role' "$secret/token.json")"
+    stack="$(jq -r '.stack' "$secret/token.json")"
     shard="$(jq -r '.shard' "$secret/token.json")"
     shards="$(jq -r '.shards' "$secret/token.json")"
     head_sha="$(jq -r '.head_sha' "$secret/token.json")"
     base_sha="$(jq -r '.base_sha // ""' "$secret/token.json")"
+    cache_namespace="$(jq -r '.cache_namespace' "$secret/token.json")"
+    dir="$(jq -r '.dir' "$state/stack.json")"
     repository="$(jq -r '.repository' "$secret/token.json")"
 
     # The server resolves the job from its check_run_id; a role or shard that
@@ -445,8 +601,8 @@ SH
     fi
     git -C "$tree" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
 
-    # ci-scope.sh diffs two trees, so it needs the base too; without one it
-    # runs everything, the same as ci.yml.
+    # The scope script diffs two trees, so it needs the base too; without one
+    # it runs everything, the same as ci.yml.
     if [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$base_sha" =~ ^0+$ ]] && [ "$base_sha" != "$head_sha" ]; then
         if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$base_sha"; then
             base_sha=''
@@ -459,9 +615,26 @@ scope_value() {
         "$state/scope.log"
 }
 
+# Without a scope script everything runs: php full, aux on, every file linted.
+# The script path is relative to the repository root, not to the manifest's
+# directory, the same place kodizm's ci-scope.sh has always run from.
 decide_scope() {
-    if ! sandboxed scope "$tree" -- bash .github/scripts/ci-scope.sh "$base_sha" "$head_sha" "$mode"; then
-        say 'ci-scope.sh failed'
+    local scope_script
+
+    scoped=false
+    gateway=true
+    php=full
+    filter=''
+    pint_base=''
+
+    scope_script="$(jq -r '.scope_script // ""' "$state/stack.json")"
+    if [ "$stack" != laravel ] || [ -z "$scope_script" ]; then
+        return 0
+    fi
+    scoped=true
+
+    if ! sandboxed scope "$tree" -- bash "./$scope_script" "$base_sha" "$head_sha" "$mode"; then
+        say 'the scope script failed'
         return 1
     fi
 
@@ -470,61 +643,84 @@ decide_scope() {
     filter="$(scope_value filter)"
     pint_base="$(scope_value pint_base)"
 
-    # ci-scope.sh is code from the head commit, so its answer is untrusted.
+    # The scope script is code from the head commit, so its answer is untrusted.
     if ! [[ "$gateway" =~ ^(true|false)$ ]] \
         || ! [[ "$php" =~ ^(none|docs|affected|full)$ ]] \
         || ! [[ "$filter" =~ ^[A-Za-z0-9_|]*$ ]] \
         || ! [[ "$pint_base" =~ ^([0-9a-f]{40})?$ ]]; then
-        say 'ci-scope.sh gave an unusable answer'
+        say 'the scope script gave an unusable answer'
         return 1
     fi
 
-    : >"$state/pint-files"
-
-    if [ "$role" != lint ] || [ -z "$pint_base" ]; then
+    if [ -z "$pint_base" ]; then
         return 0
     fi
 
-    # Same list as ci.yml's Pint step: PHP files added, copied, modified or
-    # renamed since pint_base, minus the directories pint.json excludes.
-    if ! sandboxed pint-diff "$tree" -- \
-        git -c core.quotePath=false diff --name-only --diff-filter=ACMR "$pint_base" HEAD -- '*.php'; then
-        say 'listing the files for Pint failed'
+    # Files added, copied, modified or renamed since pint_base; the manifest's
+    # lint commands pick their own languages and exclusions from the list. Its
+    # log is the list, so git's stderr stays out of it.
+    if ! sandboxed changed-files "$tree" -- \
+        sh -c "exec git -c core.quotePath=false diff --name-only --diff-filter=ACMR \"\$1\" HEAD 2>/dev/null" \
+        kci-diff "$pint_base"; then
+        say 'listing the changed files failed'
         return 1
     fi
-
-    awk '/\.php$/ && !/^-/ && !/^(bootstrap\/cache|node_modules|packages|public|references|storage|vendor)\//' \
-        "$state/pint-diff.log" >"$state/pint-files"
 }
 
-# Lock file contents only: run.yml restores the cache under this key, and the
-# key reveals nothing a guess could not.
+# Lock file contents under the manifest's directory: run.yml restores the cache
+# under `kci-<namespace>-<stack>-<hash>` and falls back to the newest entry of
+# the same namespace and stack, so one repository never restores another's.
 cache_key() {
+    local workdir="$1"
+    local lock_files=(
+        composer.lock
+        package-lock.json
+    )
     local file
+    local hash
 
-    for file in composer.lock package-lock.json; do
-        if [ -f "$tree/$file" ] && [ ! -L "$tree/$file" ]; then
-            cat "$tree/$file"
-        fi
-    done | sha256sum | cut -d' ' -f1
+    if [ "$stack" = flutter ]; then
+        lock_files=(
+            pubspec.lock
+        )
+    fi
+
+    hash="$(
+        for file in "${lock_files[@]}"; do
+            if [ -f "$workdir/$file" ] && [ ! -L "$workdir/$file" ]; then
+                cat "$workdir/$file"
+            fi
+        done | sha256sum | cut -d' ' -f1
+    )"
+
+    printf '%s-%s-%s\n' "$cache_namespace" "$stack" "$hash"
 }
 
 prepare() {
+    local workdir
+    local key
+
     say 'prepare'
 
     # 1. Nothing may be running as uid 2000 while the tokens exist.
     kci-sandbox --reap
 
-    # 2. Facts and token, then the source, then the token is gone.
+    # 2. Facts, manifest and token, then the source, then the token is gone.
     exchange_token
     fetch_source
     revoke_token
     say "mode=$mode"
 
-    # 3. The repository's own scope rules run as uid 2000, after revocation.
+    # 3. Root resolves the manifest's directory and hashes the lock files
+    #    before any repository code has run.
+    if ! workdir="$(resolve_dir "$tree" "$dir")"; then
+        say 'the manifest directory is not usable'
+        return 1
+    fi
+    key="$(cache_key "$workdir")"
+
+    # 4. The repository's own scope rules run as uid 2000, after revocation.
     #    -h: a symlink in the checkout is re-owned itself, never its target.
-    local key
-    key="$(cache_key)"
     chown -R -h "$sandbox_uid:$sandbox_uid" "$tree"
     decide_scope
     rm -rf "$tree/.git"
@@ -532,17 +728,31 @@ prepare() {
     jq -n \
         --arg mode "$mode" \
         --arg role "$role" \
+        --arg stack "$stack" \
         --argjson shard "$shard" \
         --argjson shards "$shards" \
+        --argjson scoped "$scoped" \
         --arg gateway "$gateway" \
         --arg php "$php" \
         --arg filter "$filter" \
         --arg pint_base "$pint_base" \
-        '{mode: $mode, role: $role, shard: $shard, shards: $shards, gateway: $gateway, php: $php, filter: $filter, pint_base: $pint_base}' \
+        '{
+            mode: $mode,
+            role: $role,
+            stack: $stack,
+            shard: $shard,
+            shards: $shards,
+            scoped: $scoped,
+            gateway: $gateway,
+            php: $php,
+            filter: $filter,
+            pint_base: $pint_base,
+        }' \
         >"$state/job.json"
 
-    printf 'cache_key=%s\nmode=%s\n' "$key" "$mode" >>"${GITHUB_OUTPUT:?}"
-    say "cache-key=$key"
+    # 5. The namespace is opaque, and actions/cache needs it for the key.
+    printf 'cache_key=%s\ncache_scope=%s-%s\nmode=%s\n' "$key" "$cache_namespace" "$stack" "$mode" \
+        >>"${GITHUB_OUTPUT:?}"
     say 'prepared'
 }
 
@@ -550,65 +760,107 @@ prepare() {
 # run
 # ---------------------------------------------------------------------------
 
+# usage: stack_sandboxed [--postgres] <log-name> [NAME=VALUE ...] -- <command> [arg ...]
+# Resolves the manifest's directory again before every call: the previous
+# command (uid 2000, reaped since, so nothing races this check) may have
+# swapped one of its components for a symlink.
+stack_sandboxed() {
+    local flags=()
+    local workdir
+
+    if [ "$1" = --postgres ]; then
+        flags=(--postgres)
+        shift
+    fi
+
+    if ! workdir="$(resolve_dir "$tree" "$dir")"; then
+        say 'the manifest directory is not usable'
+        on_error "$LINENO"
+    fi
+
+    sandboxed "${flags[@]}" "$1" "$workdir" "${@:2}"
+}
+
+# usage: run_commands <phase> <manifest-key>
+# Runs the manifest's list under <manifest-key> one by one, each as `bash -c`
+# in the manifest's directory. Fails at the first that fails.
+run_commands() {
+    local phase="$1"
+    local key="$2"
+    local count
+    local index
+    local command
+
+    # Callers test this function, which switches errexit off in here; a jq
+    # failure must not read as an empty, passing list.
+    count="$(jq --arg key "$key" '.[$key] // [] | length' "$state/stack.json")" || on_error "$LINENO"
+
+    for ((index = 0; index < count; index++)); do
+        command="$(jq -r --arg key "$key" --argjson index "$index" '.[$key][$index]' "$state/stack.json")" \
+            || on_error "$LINENO"
+
+        if ! stack_sandboxed "$phase-$((index + 1))" -- bash -c "$command"; then
+            return 1
+        fi
+    done
+}
+
 composer_install() {
-    sandboxed install "$tree" BROADCAST_CONNECTION=log -- \
+    stack_sandboxed install BROADCAST_CONNECTION=log -- \
         composer install --no-interaction --no-progress --prefer-dist "$@"
 }
 
-run_lint() {
-    local files=()
-    local args=(
-        --test
-        --format=json
-    )
+# Composer first (with the given flags), then the manifest's setup list.
+laravel_setup() {
+    say 'install'
+    if ! composer_install "$@"; then
+        return 1
+    fi
 
+    say 'setup'
+    run_commands setup setup
+}
+
+run_lint() {
     if [ "$php" != affected ] && [ "$php" != full ]; then
         status=skipped
         return 0
     fi
 
-    if [ -n "$pint_base" ]; then
-        mapfile -t files <"$state/pint-files"
-        if [ "${#files[@]}" -eq 0 ]; then
-            status=passed
-            return 0
-        fi
-        args+=(-- "${files[@]}")
-    else
-        args+=(--parallel)
-    fi
-
-    say 'install'
-    if ! composer_install --no-scripts; then
+    if ! laravel_setup --no-scripts; then
         status=errored
         return 0
     fi
 
     say 'lint'
-    # Pint's JSON goes to its own file; its stderr stays in the log. $out is a
-    # fixed path, so expanding it into the script is safe.
-    if sandboxed lint "$tree" -- \
-        sh -c "exec \"\$@\" >'$out/pint.json'" kci-stdout vendor/bin/pint "${args[@]}"; then
+    if run_commands lint lint; then
         status=passed
     else
         status=failed
     fi
 
-    collect pint pint.json
+    collect_report
 }
 
-run_gateway() {
+run_aux() {
     if [ "$gateway" != true ]; then
         status=skipped
         return 0
     fi
 
-    say 'gateway'
-    if sandboxed gateway "$tree/packages/kodizm-gateway" -- sh -c 'go vet ./... && go test -race ./...'; then
+    if ! laravel_setup --no-scripts; then
+        status=errored
+        return 0
+    fi
+
+    say 'aux'
+    if run_commands aux aux; then
         status=passed
     else
         status=failed
     fi
+
+    collect_report
 }
 
 run_warm() {
@@ -626,6 +878,7 @@ run_warm() {
 }
 
 run_test() {
+    local flags=()
     local args=(
         artisan
         test
@@ -662,78 +915,203 @@ run_test() {
     esac
     args+=(--log-junit "$out/junit.xml")
 
-    say 'install'
-    if ! composer_install --optimize-autoloader; then
-        status=errored
-        return 0
+    if jq -e '(.services // []) | index("postgres")' "$state/stack.json" >/dev/null; then
+        flags=(--postgres)
     fi
 
-    if [ "$php" != docs ]; then
-        if ! sandboxed assets "$tree" -- npm ci || ! sandboxed assets "$tree" -- npm run build; then
-            status=errored
-            return 0
-        fi
-    fi
-
-    if ! sandboxed setup "$tree" -- cp .env.example .env \
-        || ! sandboxed setup "$tree" -- php artisan key:generate --no-interaction \
-        || ! sandboxed setup "$tree" -- php artisan passport:keys --force --no-interaction; then
+    if ! laravel_setup --optimize-autoloader; then
         status=errored
         return 0
     fi
 
     say 'test'
-    if sandboxed test "$tree" -- php "${args[@]}"; then
+    if stack_sandboxed "${flags[@]}" test -- php "${args[@]}"; then
         status=passed
     else
         status=failed
     fi
 
-    collect junit junit.xml
+    collect_report
+}
+
+run_flutter_lint() {
+    say 'setup'
+    if ! run_commands setup setup; then
+        status=errored
+        return 0
+    fi
+
+    say 'lint'
+    if run_commands lint lint; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
+}
+
+run_flutter_warm() {
+    if [ "$mode" != main ]; then
+        status=skipped
+        return 0
+    fi
+
+    say 'warm'
+    if stack_sandboxed install -- flutter pub get; then
+        status=passed
+    else
+        status=failed
+    fi
+}
+
+run_flutter_test() {
+    local command
+
+    # The default expands inside the sandbox, from the KCI_* environment.
+    command="$(jq -r '.test.command // empty' "$state/stack.json")"
+    if [ -z "$command" ]; then
+        command="$(
+            cat <<'SH'
+flutter test --total-shards "$KCI_SHARDS" --shard-index "$((KCI_SHARD - 1))" --file-reporter "json:$KCI_REPORT_DIR/flutter.json"
+SH
+        )"
+    fi
+
+    say 'setup'
+    if ! run_commands setup setup; then
+        status=errored
+        return 0
+    fi
+
+    say 'test'
+    if stack_sandboxed test -- bash -c "$command"; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect_report
 }
 
 run() {
     say 'run'
 
-    if [ ! -f "$state/job.json" ]; then
+    if [ ! -f "$state/job.json" ] || [ ! -f "$state/stack.json" ]; then
         say 'prepare has not run in this container'
         return 1
     fi
 
     mode="$(jq -r '.mode' "$state/job.json")"
     role="$(jq -r '.role' "$state/job.json")"
+    stack="$(jq -r '.stack' "$state/job.json")"
     shard="$(jq -r '.shard' "$state/job.json")"
     shards="$(jq -r '.shards' "$state/job.json")"
+    scoped="$(jq -r '.scoped' "$state/job.json")"
     gateway="$(jq -r '.gateway' "$state/job.json")"
     php="$(jq -r '.php' "$state/job.json")"
     filter="$(jq -r '.filter' "$state/job.json")"
     pint_base="$(jq -r '.pint_base' "$state/job.json")"
+    dir="$(jq -r '.dir' "$state/stack.json")"
 
     # 1. The cache was restored by root; -h keeps a planted symlink from
     #    handing uid 2000 the file it points at.
     kci-sandbox --reap
     install -d -m 0700 -o "$sandbox_uid" -g "$sandbox_uid" "$out"
-    install -d -m 0700 "$cache/composer" "$cache/npm"
+    install -d -m 0700 "$cache/composer" "$cache/npm" "$cache/pub"
     chown -R -h "$sandbox_uid:$sandbox_uid" "$cache"
 
+    # 2. The environment every manifest command sees (names fixed by the
+    #    manifest contract). The changed-file list is root's copy, read-only.
     sandbox_env=(
-        APP_ENV=testing
-        COMPOSER_CACHE_DIR="$cache/composer"
-        npm_config_cache="$cache/npm"
+        KCI_REPORT_DIR="$out"
     )
+    if [ "$role" = test ] || [ "$role" = flutter-test ]; then
+        sandbox_env+=(
+            KCI_SHARD="$shard"
+            KCI_SHARDS="$shards"
+        )
+    fi
+    if [ "$scoped" = true ]; then
+        sandbox_env+=(
+            KCI_SCOPE_PHP="$php"
+            KCI_SCOPE_FILTER="$filter"
+        )
+    fi
+    if [ -n "$pint_base" ]; then
+        install -m 0644 "$state/changed-files.log" "$changed_files"
+        sandbox_env+=(
+            KCI_CHANGED_FILES="$changed_files"
+        )
+    fi
+    if [ "$stack" = flutter ]; then
+        sandbox_env+=(
+            FLUTTER_SUPPRESS_ANALYTICS=true
+            PUB_CACHE="$cache/pub"
+        )
+    else
+        sandbox_env+=(
+            APP_ENV=testing
+            COMPOSER_CACHE_DIR="$cache/composer"
+            npm_config_cache="$cache/npm"
+        )
+    fi
 
-    # 2. The role command, whose outcome becomes the status.
+    # 3. The role's commands, whose outcome becomes the status.
     write_empty_summary
     case "$role" in
         lint) run_lint ;;
-        gateway) run_gateway ;;
+        aux) run_aux ;;
         warm) run_warm ;;
         test) run_test ;;
+        flutter-lint) run_flutter_lint ;;
+        flutter-warm) run_flutter_warm ;;
+        flutter-test) run_flutter_test ;;
     esac
 
-    # 3. Kill, then report.
+    # 4. Kill, then report.
     say 'report'
     report
 }
 
-"$phase"
+main() {
+    phase="${1:-}"
+
+    case "$phase" in
+        prepare | run) ;;
+        *)
+            echo 'usage: kci-job prepare | run' >&2
+            exit 2
+            ;;
+    esac
+
+    # The run id reaches a URL body and the token exchange, so it is checked
+    # before anything touches the network.
+    if ! [[ "${KCI_RUN_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo 'kci: KCI_RUN_ID is not a lowercase UUID' >&2
+        exit 2
+    fi
+
+    if [ -z "${KCI_JOB_NAME:-}" ]; then
+        echo 'kci: KCI_JOB_NAME is empty' >&2
+        exit 2
+    fi
+
+    umask 077
+    install -d -m 0711 "$root"
+    install -d -m 0700 "$state" "$secret"
+
+    # fd 3 is the public log; stdout and stderr of everything else go private.
+    # kci-sandbox closes fd 3 before it drops privileges.
+    exec 3>&1
+    exec >>"$state/$phase.log" 2>&1
+
+    trap 'on_error "$LINENO"' ERR
+
+    "$phase"
+}
+
+# Sourced by scripts/test/kci-job.test.sh for its pure helpers; run otherwise.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

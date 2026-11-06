@@ -3,7 +3,7 @@
 # that account still owns. Everything a pull request ships (dependency
 # installs, tests, linters, repository scripts) goes through here.
 #
-# usage: kci-sandbox [--keep] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+# usage: kci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
 #        kci-sandbox --reap
 #
 # The child runs with:
@@ -30,15 +30,39 @@
 # --keep skips that kill; only the isolation probe uses it, to prove the
 # survivor check fails when a process is left behind.
 #
+# --postgres starts a throwaway PostgreSQL server inside the same sandbox
+# before the command: initdb and pg_ctl run as uid 2000 under the same env -i,
+# the data directory lives in the fresh HOME, and the server listens on the
+# Unix socket in /run/kci-postgres only (superuser postgres, trust auth,
+# database postgres, port 5432; PGHOST, PGPORT, PGUSER and PGDATABASE say so).
+# The server, and anything it starts (COPY TO PROGRAM), is uid 2000, so the
+# kill loop takes it down with the command.
+#
 # Exits with the child's status, or 125 when uid 2000 processes survive the
 # kill loop. --reap runs the kill loop alone (0, or 125 on survivors).
 set -euo pipefail
 
 sandbox_uid=2000
 nproc_limit=4096
+postgres_socket_dir=/run/kci-postgres
+
+# Runs as uid 2000 in front of the command. /run is root-only, so the socket
+# directory root prepares there cannot have been swapped for a symlink.
+postgres_wrapper="$(
+    cat <<'SH'
+set -e
+initdb --pgdata="$HOME/pgdata" --username=postgres --auth=trust --encoding=UTF8 --no-sync --no-instructions
+if ! pg_ctl --pgdata="$HOME/pgdata" --log="$HOME/postgres.log" --wait \
+    --options="-c listen_addresses='' -c unix_socket_directories='$PGHOST' -c fsync=off" start; then
+    cat "$HOME/postgres.log"
+    exit 1
+fi
+exec "$@"
+SH
+)"
 
 usage() {
-    echo 'usage: kci-sandbox [--keep] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]' >&2
+    echo 'usage: kci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]' >&2
     echo '       kci-sandbox --reap' >&2
     exit 2
 }
@@ -109,10 +133,15 @@ if [ "${1:-}" = --reap ]; then
 fi
 
 keep=false
-if [ "${1:-}" = --keep ]; then
-    keep=true
+postgres=false
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --keep) keep=true ;;
+        --postgres) postgres=true ;;
+        *) break ;;
+    esac
     shift
-fi
+done
 
 [ $# -ge 4 ] || usage
 
@@ -147,7 +176,21 @@ chown "$sandbox_uid:$sandbox_uid" "$home"
 chmod 0700 "$home"
 child_env+=("HOME=$home")
 
-# 2. Run the child. The subshell stays root until setpriv, so it can open the
+# 2. The database, when asked for, comes up inside the child itself, so it
+#    shares the child's environment, limits and fate.
+if [ "$postgres" = true ]; then
+    rm -rf "$postgres_socket_dir"
+    install -d -m 0700 -o "$sandbox_uid" -g "$sandbox_uid" "$postgres_socket_dir"
+    child_env+=(
+        "PGHOST=$postgres_socket_dir"
+        PGPORT=5432
+        PGUSER=postgres
+        PGDATABASE=postgres
+    )
+    set -- bash -c "$postgres_wrapper" kci-postgres "$@"
+fi
+
+# 3. Run the child. The subshell stays root until setpriv, so it can open the
 #    root-owned log and close every inherited descriptor above 2 first.
 status=0
 (
@@ -174,10 +217,13 @@ status=0
         -- env -i "${child_env[@]}" "$@"
 ) || status=$?
 
-# 3. Nothing the child started may outlive it: the caller uses secrets next.
+# 4. Nothing the child started may outlive it: the caller uses secrets next.
 if [ "$keep" = false ]; then
     reap || exit $?
     rm -rf "$home"
+    if [ "$postgres" = true ]; then
+        rm -rf "$postgres_socket_dir"
+    fi
 fi
 
 exit "$status"

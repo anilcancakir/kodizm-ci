@@ -1,11 +1,18 @@
 name: CI
 
 # Dispatched by kodizm.com only. ci_run_id is an opaque id: it names nothing,
-# and kci-job rejects anything but a lowercase UUID. Everything private (the
-# source, the commits, the scope) arrives at runtime through the OIDC token
-# exchange inside kci-job and never touches this file, the run name or the log.
-# The image is pinned by digest so a push to a mutable tag cannot change what
+# and kci-job rejects anything but a lowercase UUID. jobs lists the job keys
+# this run needs (`lint`, `aux`, `warm`, `test-1`..`test-4`, `flutter-lint`,
+# `flutter-warm`, `flutter-test-1`..`flutter-test-4`); a job whose key is
+# absent never starts. Everything private (the source, the commits, the
+# manifest, the scope) arrives at runtime through the OIDC token exchange
+# inside kci-job and never touches this file, the run name or the log.
+# Images are pinned by digest so a push to a mutable tag cannot change what
 # runs with id-token: write; a new image is adopted by editing the digest here.
+#
+# A test matrix starts only the shards it was asked for: the job's `if` needs
+# shard 1 (a job-level `if` cannot see the matrix), and `exclude` drops every
+# other shard whose key is absent.
 run-name: CI
 
 on:
@@ -13,6 +20,10 @@ on:
     inputs:
       ci_run_id:
         description: Opaque run id
+        type: string
+        required: true
+      jobs:
+        description: JSON array of job keys
         type: string
         required: true
 
@@ -24,6 +35,7 @@ permissions:
 jobs:
   lint:
     name: lint
+    if: contains(fromJSON(inputs.jobs), 'lint')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
@@ -46,15 +58,16 @@ jobs:
         with:
           path: /kci/cache
           key: kci-${{ steps.prepare.outputs.cache_key }}
-          restore-keys: kci-
+          restore-keys: kci-${{ steps.prepare.outputs.cache_scope }}-
       - name: Run
         env:
           KCI_RUN_ID: ${{ inputs.ci_run_id }}
           KCI_JOB_NAME: lint
         run: kci-job run
 
-  gateway:
-    name: gateway
+  aux:
+    name: aux
+    if: contains(fromJSON(inputs.jobs), 'aux')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
@@ -70,24 +83,26 @@ jobs:
         id: prepare
         env:
           KCI_RUN_ID: ${{ inputs.ci_run_id }}
-          KCI_JOB_NAME: gateway
+          KCI_JOB_NAME: aux
         run: kci-job prepare
       - name: Restore dependency cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /kci/cache
           key: kci-${{ steps.prepare.outputs.cache_key }}
-          restore-keys: kci-
+          restore-keys: kci-${{ steps.prepare.outputs.cache_scope }}-
       - name: Run
         env:
           KCI_RUN_ID: ${{ inputs.ci_run_id }}
-          KCI_JOB_NAME: gateway
+          KCI_JOB_NAME: aux
         run: kci-job run
 
-  # Starts in pr mode too: kci-job reports it skipped there. Only a main run
-  # writes the cache, so pull request code can never seed it.
+  # Dispatched for main runs only, and kci-job reports it skipped in pr mode
+  # anyway. Only a main run writes the cache, so pull request code can never
+  # seed it.
   warm:
     name: warm
+    if: contains(fromJSON(inputs.jobs), 'warm')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
@@ -110,7 +125,7 @@ jobs:
         with:
           path: /kci/cache
           key: kci-${{ steps.prepare.outputs.cache_key }}
-          restore-keys: kci-
+          restore-keys: kci-${{ steps.prepare.outputs.cache_scope }}-
       - name: Run
         env:
           KCI_RUN_ID: ${{ inputs.ci_run_id }}
@@ -125,6 +140,7 @@ jobs:
 
   test:
     name: test (${{ matrix.shard }})
+    if: contains(fromJSON(inputs.jobs), 'test-1')
     runs-on: ubuntu-latest
     # Below kodizm.com's 30-minute run timeout, which counts from the claim
     # and so includes queueing; a job still allowed to run is never reaped.
@@ -137,6 +153,10 @@ jobs:
           - 2
           - 3
           - 4
+        exclude:
+          - shard: ${{ !contains(fromJSON(inputs.jobs), 'test-2') && 2 || 0 }}
+          - shard: ${{ !contains(fromJSON(inputs.jobs), 'test-3') && 3 || 0 }}
+          - shard: ${{ !contains(fromJSON(inputs.jobs), 'test-4') && 4 || 0 }}
     container:
       image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
       credentials:
@@ -157,9 +177,126 @@ jobs:
         with:
           path: /kci/cache
           key: kci-${{ steps.prepare.outputs.cache_key }}
-          restore-keys: kci-
+          restore-keys: kci-${{ steps.prepare.outputs.cache_scope }}-
       - name: Run
         env:
           KCI_RUN_ID: ${{ inputs.ci_run_id }}
           KCI_JOB_NAME: test (${{ matrix.shard }})
+        run: kci-job run
+
+  # The flutter image digest is a placeholder until its first build is pinned.
+  flutter-lint:
+    name: flutter-lint
+    if: contains(fromJSON(inputs.jobs), 'flutter-lint')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
+    steps:
+      - name: Prepare
+        id: prepare
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: flutter-lint
+        run: kci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: kci-${{ steps.prepare.outputs.cache_scope }}-
+      - name: Run
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: flutter-lint
+        run: kci-job run
+
+  # Main runs only, like warm: the one flutter job that writes the cache.
+  flutter-warm:
+    name: flutter-warm
+    if: contains(fromJSON(inputs.jobs), 'flutter-warm')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
+    steps:
+      - name: Prepare
+        id: prepare
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: flutter-warm
+        run: kci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: kci-${{ steps.prepare.outputs.cache_scope }}-
+      - name: Run
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: flutter-warm
+        run: kci-job run
+      - name: Save dependency cache
+        if: steps.prepare.outputs.mode == 'main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+
+  flutter-test:
+    name: flutter-test (${{ matrix.shard }})
+    if: contains(fromJSON(inputs.jobs), 'flutter-test-1')
+    runs-on: ubuntu-latest
+    # Below kodizm.com's 30-minute run timeout, the same as test.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - 1
+          - 2
+          - 3
+          - 4
+        exclude:
+          - shard: ${{ !contains(fromJSON(inputs.jobs), 'flutter-test-2') && 2 || 0 }}
+          - shard: ${{ !contains(fromJSON(inputs.jobs), 'flutter-test-3') && 3 || 0 }}
+          - shard: ${{ !contains(fromJSON(inputs.jobs), 'flutter-test-4') && 4 || 0 }}
+    container:
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
+    steps:
+      - name: Prepare
+        id: prepare
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: flutter-test (${{ matrix.shard }})
+        run: kci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /kci/cache
+          key: kci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: kci-${{ steps.prepare.outputs.cache_scope }}-
+      - name: Run
+        env:
+          KCI_RUN_ID: ${{ inputs.ci_run_id }}
+          KCI_JOB_NAME: flutter-test (${{ matrix.shard }})
         run: kci-job run

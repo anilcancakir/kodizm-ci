@@ -16,17 +16,28 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  REPOSITORY: ghcr.io/kodizm/kodizm-ci
-
 jobs:
   build:
+    # Copies of this repository never publish: the registry namespace is the original's alone.
+    if: github.repository == 'kodizm/kodizm-ci'
+    name: build (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: php
+            dockerfile: Dockerfile
+            repository: ghcr.io/kodizm/kodizm-ci
+          - name: flutter
+            dockerfile: Dockerfile.flutter
+            repository: ghcr.io/kodizm/kodizm-ci-flutter
     env:
+      REPOSITORY: ${{ matrix.repository }}
       # Only a run on main publishes. Pull requests (forks included) and dispatches from other refs
       # build without pushing and never log in to the registry.
       PUBLISH: ${{ github.ref == 'refs/heads/main' }}
@@ -50,6 +61,7 @@ jobs:
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
+          file: ${{ matrix.dockerfile }}
           push: ${{ env.PUBLISH == 'true' }}
           provenance: false
           tags: ${{ env.REPOSITORY }}:cand-${{ github.sha }}
@@ -58,12 +70,23 @@ jobs:
 
   promote:
     needs: build
-    if: github.ref == 'refs/heads/main'
+    if: github.repository == 'kodizm/kodizm-ci' && github.ref == 'refs/heads/main'
+    name: promote (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: php
+            repository: ghcr.io/kodizm/kodizm-ci
+          - name: flutter
+            repository: ghcr.io/kodizm/kodizm-ci-flutter
+    env:
+      REPOSITORY: ${{ matrix.repository }}
 
     steps:
       - name: Set up Docker Buildx
@@ -86,4 +109,4 @@ jobs:
             "${REPOSITORY}:cand-${GITHUB_SHA}"
           digest="$(docker buildx imagetools inspect "${REPOSITORY}:latest" --format '{{json .Manifest}}' | jq -r .digest)"
           [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "unexpected digest: ${digest}" >&2; exit 1; }
-          echo "promoted-digest: ${digest}"
+          echo "promoted-digest: ${REPOSITORY}@${digest}"
