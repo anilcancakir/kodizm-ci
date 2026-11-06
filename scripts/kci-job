@@ -171,18 +171,14 @@ $summary = [
     'annotations' => [],
 ];
 
+// Failures only: kodizm.com turns every failure with a file and line into an
+// annotation, so sending annotations too would show each one twice.
 $fail = static function (string $path, int $line, string $name, string $message) use (&$summary, $clip): void {
     $summary['failures'][] = [
         'file' => $path,
         'line' => $line,
         'name' => $name,
         'message' => $clip($message),
-    ];
-    $summary['annotations'][] = [
-        'path' => $path,
-        'start_line' => max(1, $line),
-        'end_line' => max(1, $line),
-        'message' => $clip($name."\n".$message),
     ];
 };
 
