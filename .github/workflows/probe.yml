@@ -31,7 +31,7 @@ jobs:
     container:
       # The same image and container options ci.yml pins, so the probe proves
       # the configuration that actually runs pull request code.
-      image: ghcr.io/kodizm/kodizm-ci@sha256:750d4b92933bc9336901dc3488c7918c46d8c02a85f22f575584fa27609b002a
+      image: ghcr.io/kodizm/kodizm-ci@sha256:50d0a4a34eeed337b06315beb125a7399c3bb2f5cbe376338eda821e3f0ba6e1
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -201,7 +201,7 @@ jobs:
     timeout-minutes: 15
     container:
       # The flutter image ci.yml pins, with the same container options.
-      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:fbbd151da41f4fb863ee53692280e9e91941fbe46419e8eea279a5cf4788d79d
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:41931bead9cce3dc57117265db91ccd58c058cb50d1391ccd975cd9cdb536909
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
