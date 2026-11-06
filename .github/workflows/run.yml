@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:718cc055e1a3b1f5bd2b5be1791f8d319cde15c641c1a4d9e09c297062f9a75f
+      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -55,7 +55,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:718cc055e1a3b1f5bd2b5be1791f8d319cde15c641c1a4d9e09c297062f9a75f
+      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -85,7 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:718cc055e1a3b1f5bd2b5be1791f8d319cde15c641c1a4d9e09c297062f9a75f
+      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -129,7 +129,7 @@ jobs:
           - 3
           - 4
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:718cc055e1a3b1f5bd2b5be1791f8d319cde15c641c1a4d9e09c297062f9a75f
+      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
