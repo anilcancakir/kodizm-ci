@@ -1,0 +1,94 @@
+name: CI
+
+# Dispatched by the CI server only; the same file serves every pool. ci_run_id
+# is an opaque id: it names nothing, and ci-job rejects anything but a
+# lowercase UUID. matrix is a JSON array with one entry per job this run
+# needs:
+#
+#   [{"name": "test (1)", "role": "test", "shard": 1,
+#     "image": "ghcr.io/<owner>/<repo>@sha256:<64 hex>", "save": false}, ...]
+#
+# name is the job's display name and what ci-job checks against its token,
+# role is lint, aux, warm, test, flutter-lint, flutter-warm or flutter-test,
+# shard is 0 when the role is not sharded, and save is true only on a warm
+# role of a main run. Images are pinned by digest so a push to a mutable tag
+# cannot change what runs with id-token: write. api, token_audience and
+# results_audience are the server's base URL and the two OIDC audiences.
+# Everything private (the source, the commits, the manifest, the scope)
+# arrives at runtime through the OIDC token exchange inside ci-job and never
+# touches this file, the run name or the log.
+run-name: CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Opaque run id
+        type: string
+        required: true
+      matrix:
+        description: JSON array of jobs
+        type: string
+        required: true
+      api:
+        description: Server base URL
+        type: string
+        required: true
+      token_audience:
+        description: OIDC audience of the token exchange
+        type: string
+        required: true
+      results_audience:
+        description: OIDC audience of the results post
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+  id-token: write
+
+jobs:
+  ci:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    # Below the server's 30-minute run timeout, which counts from the claim
+    # and so includes queueing; a job still allowed to run is never reaped.
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.matrix) }}
+    container:
+      image: ${{ matrix.image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      # PID 1 is otherwise `tail -f /dev/null`, which never reaps orphans, so a
+      # test that waits for a process it signalled sees a zombie as alive.
+      options: --init
+    env:
+      CI_RUN_ID: ${{ inputs.ci_run_id }}
+      CI_JOB_NAME: ${{ matrix.name }}
+      CI_API: ${{ inputs.api }}
+      CI_TOKEN_AUDIENCE: ${{ inputs.token_audience }}
+      CI_RESULTS_AUDIENCE: ${{ inputs.results_audience }}
+    steps:
+      - name: Prepare
+        id: prepare
+        run: ci-job prepare
+      - name: Restore dependency cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /ci/cache
+          key: ci-${{ steps.prepare.outputs.cache_key }}
+          restore-keys: ci-${{ steps.prepare.outputs.cache_scope }}-
+      - name: Run
+        run: ci-job run
+      # Only a main run writes the cache, so pull request code can never seed it.
+      - name: Save dependency cache
+        if: matrix.save && steps.prepare.outputs.mode == 'main'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /ci/cache
+          key: ci-${{ steps.prepare.outputs.cache_key }}

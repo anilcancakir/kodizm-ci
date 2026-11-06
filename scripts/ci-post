@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Sends one HTTP request whose credentials live in a curl config file, and
-# retries while kodizm.com or GitHub is briefly unable to answer it.
+# retries while the server or GitHub is briefly unable to answer it.
 #
-# usage: kci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]
+# usage: ci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]
 #
 # <config-file>   curl config lines such as `header = "Authorization: Bearer ..."`,
 #                 mode 0600. A bearer on the command line would sit in
@@ -19,7 +19,7 @@
 set -euo pipefail
 
 usage() {
-    echo 'usage: kci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]' >&2
+    echo 'usage: ci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]' >&2
     exit 2
 }
 
@@ -43,6 +43,7 @@ curl_args=(
     --config "$config"
     --silent
     --show-error
+    --user-agent 'ci-job/1'
     --max-time 60
     --dump-header "$headers"
     --output "$response"

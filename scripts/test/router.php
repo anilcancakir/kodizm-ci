@@ -1,10 +1,10 @@
 <?php
 
-// Test double for kci-post, served by `php -S`. It records every request and
-// answers /sequence with 401, 429, 503 and then 200, so a single kci-post run
+// Test double for ci-post, served by `php -S`. It records every request and
+// answers /sequence with 401, 429, 503 and then 200, so a single ci-post run
 // walks each retry branch; /reject always answers 422.
 
-$state = getenv('KCI_TEST_STATE');
+$state = getenv('CI_TEST_STATE');
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
 
 if ($path === '/health') {
@@ -20,6 +20,7 @@ $record = static function (string $name, string $line) use ($state): void {
 $record('authorization', $_SERVER['HTTP_AUTHORIZATION'] ?? '');
 $record('method', $_SERVER['REQUEST_METHOD']);
 $record('content-type', $_SERVER['CONTENT_TYPE'] ?? '');
+$record('user-agent', $_SERVER['HTTP_USER_AGENT'] ?? '');
 $record('body', file_get_contents('php://input'));
 
 // Keeps each curl process alive long enough for the test to sample its argv.

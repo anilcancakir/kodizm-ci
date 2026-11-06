@@ -18,8 +18,9 @@ permissions:
 
 jobs:
   build:
-    # Copies of this repository never publish: the registry namespace is the original's alone.
-    if: github.repository == 'kodizm/kodizm-ci'
+    # Copies of this repository never publish unless the repository variable CI_PUBLISH is `true`:
+    # the registry namespace is the owner's, and a neutral org repository opts in by setting it.
+    if: contains(fromJSON('["kodizm/kodizm-ci"]'), github.repository) || vars.CI_PUBLISH == 'true'
     name: build (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -32,17 +33,21 @@ jobs:
         include:
           - name: php
             dockerfile: Dockerfile
-            repository: ghcr.io/kodizm/kodizm-ci
+            suffix: ''
           - name: flutter
             dockerfile: Dockerfile.flutter
-            repository: ghcr.io/kodizm/kodizm-ci-flutter
+            suffix: -flutter
     env:
-      REPOSITORY: ${{ matrix.repository }}
+      IMAGE_SUFFIX: ${{ matrix.suffix }}
       # Only a run on main publishes. Pull requests (forks included) and dispatches from other refs
       # build without pushing and never log in to the registry.
       PUBLISH: ${{ github.ref == 'refs/heads/main' }}
 
     steps:
+      # The registry requires lower case; the image is named after the repository that builds it.
+      - name: Name the image
+        run: echo "REPOSITORY=ghcr.io/${GITHUB_REPOSITORY,,}${IMAGE_SUFFIX}" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -70,7 +75,7 @@ jobs:
 
   promote:
     needs: build
-    if: github.repository == 'kodizm/kodizm-ci' && github.ref == 'refs/heads/main'
+    if: (contains(fromJSON('["kodizm/kodizm-ci"]'), github.repository) || vars.CI_PUBLISH == 'true') && github.ref == 'refs/heads/main'
     name: promote (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -82,13 +87,16 @@ jobs:
       matrix:
         include:
           - name: php
-            repository: ghcr.io/kodizm/kodizm-ci
+            suffix: ''
           - name: flutter
-            repository: ghcr.io/kodizm/kodizm-ci-flutter
+            suffix: -flutter
     env:
-      REPOSITORY: ${{ matrix.repository }}
+      IMAGE_SUFFIX: ${{ matrix.suffix }}
 
     steps:
+      - name: Name the image
+        run: echo "REPOSITORY=ghcr.io/${GITHUB_REPOSITORY,,}${IMAGE_SUFFIX}" >> "$GITHUB_ENV"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 

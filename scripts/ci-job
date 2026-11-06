@@ -1,48 +1,49 @@
 #!/usr/bin/env bash
-# One Kodizm virtual CI job, in the two steps run.yml calls:
+# One virtual CI job, in the two steps ci.yml calls:
 #
-# usage: kci-job prepare | run
+# usage: ci-job prepare | run
 #
-# prepare  trades an OIDC token (aud kodizm-ci-token) for the job's facts, the
+# prepare  trades an OIDC token (aud CI_TOKEN_AUDIENCE) for the job's facts, the
 #          repository's manifest block for this job's stack and a short-lived
 #          installation token, fetches the private head and base commits with
 #          it, revokes it, resolves the manifest's directory, lets the
 #          repository's own scope script decide the scope (as uid 2000; in pr
 #          mode the base commit's copy of it), removes .git, and writes
-#          cache_key, cache_scope and mode to $GITHUB_OUTPUT (masked). run.yml
+#          cache_key, cache_scope and mode to $GITHUB_OUTPUT (masked). ci.yml
 #          then restores the dependency cache into
-#          /kci/cache, before any pull request code has run.
+#          /ci/cache, before any pull request code has run.
 # run      installs dependencies and runs the role's manifest commands as uid
-#          2000 through kci-sandbox, kills every uid 2000 process, and only then
-#          fetches a fresh OIDC token (aud kodizm-ci-results) to post the
+#          2000 through ci-sandbox, kills every uid 2000 process, and only then
+#          fetches a fresh OIDC token (aud CI_RESULTS_AUDIENCE) to post the
 #          results. It posts on a failed command (status failed) and on an
 #          internal error (status errored) too.
 #
-# Environment: KCI_RUN_ID (lowercase UUID), KCI_JOB_NAME (`lint`, `test (2)`,
-# `flutter-test (1)`), KCI_API (default https://kodizm.com) and the runner's
-# ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN (job permission id-token: write).
+# Environment: CI_RUN_ID (lowercase UUID), CI_JOB_NAME (`lint`, `test (2)`,
+# `flutter-test (1)`), CI_API (the server's base URL), CI_TOKEN_AUDIENCE and
+# CI_RESULTS_AUDIENCE (the two OIDC audiences), none with a default, and the
+# runner's ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN (job permission id-token: write).
 #
 # The manifest and the cache namespace come from the token response only,
 # never from the checkout. Every manifest command runs as `bash -c` under
-# kci-sandbox in the manifest's directory with KCI_REPORT_DIR (a uid 2000
-# directory for junit.xml, pint.json or flutter.json), KCI_SHARD and
-# KCI_SHARDS (test roles), KCI_SCOPE_PHP and KCI_SCOPE_FILTER (laravel with a
-# scope script) and KCI_CHANGED_FILES (a file of repository-relative paths
+# ci-sandbox in the manifest's directory with CI_REPORT_DIR (a uid 2000
+# directory for junit.xml, pint.json or flutter.json), CI_SHARD and
+# CI_SHARDS (test roles), CI_SCOPE_PHP and CI_SCOPE_FILTER (laravel with a
+# scope script) and CI_CHANGED_FILES (a file of repository-relative paths
 # changed since the scope's pint_base; unset when everything is checked).
 #
-# The public log gets fixed `kci:` lines only, never a manifest command, a
+# The public log gets fixed `ci:` lines only, never a manifest command, a
 # directory or a repository name. Every command's own output goes to
-# root-only logs under /kci/state, because an error message (git's, jq's) can
+# root-only logs under /ci/state, because an error message (git's, jq's) can
 # quote the private repository name or a token. No secret is ever an
 # argument: curl reads headers from 0600 config files, git reads the token
 # through GIT_ASKPASS.
 #
-# Exits 0 once kodizm.com accepted the results, whatever their status, so the
+# Exits 0 once the server accepted the results, whatever their status, so the
 # public run carries no verdict on private code; 1 when they were not
 # delivered or prepare failed.
 set -Eeuo pipefail
 
-root=/kci
+root=/ci
 state="$root/state"
 secret="$root/secret"
 tree="$root/tree"
@@ -51,8 +52,10 @@ cache="$root/cache"
 changed_files="$root/changed-files"
 scope_file="$root/scope-script"
 sandbox_uid=2000
-api="${KCI_API:-https://kodizm.com}"
+api="${CI_API:-}"
 api="${api%/}"
+token_audience="${CI_TOKEN_AUDIENCE:-}"
+results_audience="${CI_RESULTS_AUDIENCE:-}"
 
 phase=''
 status=errored
@@ -61,7 +64,7 @@ reporting=false
 sandbox_env=()
 
 say() {
-    printf 'kci: %s\n' "$1" >&3
+    printf 'ci: %s\n' "$1" >&3
 }
 
 http_status() {
@@ -82,7 +85,7 @@ sandboxed() {
     shift 2
 
     last_log="$name"
-    kci-sandbox "${flags[@]}" "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@"
+    ci-sandbox "${flags[@]}" "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@"
 }
 
 # Prints the real path of <dir> inside <tree>, or fails for an absolute path,
@@ -139,7 +142,7 @@ oidc_config() {
 
     printf 'header = "Authorization: Bearer %s"\n' "$request_token" >"$secret/oidc-request.curl"
 
-    if ! kci-post "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" "$secret/oidc-request.curl" "$secret/oidc.json"; then
+    if ! ci-post "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" "$secret/oidc-request.curl" "$secret/oidc.json"; then
         say "OIDC token request failed (HTTP $(http_status "$secret/oidc.json"))"
         rm -f "$secret/oidc-request.curl" "$secret/oidc.json"
         return 1
@@ -161,7 +164,7 @@ revoke_token() {
         return 0
     fi
 
-    if ! kci-post -X DELETE https://api.github.com/installation/token "$secret/github.curl" "$state/revoke.json"; then
+    if ! ci-post -X DELETE https://api.github.com/installation/token "$secret/github.curl" "$state/revoke.json"; then
         revoked=false
     fi
 
@@ -204,7 +207,7 @@ $summary = [
     'annotations' => [],
 ];
 
-// Failures only: kodizm.com turns every failure with a file and line into an
+// Failures only: the server turns every failure with a file and line into an
 // annotation, so sending annotations too would show each one twice.
 $fail = static function (string $path, int $line, string $name, string $message) use (&$summary, $clip): void {
     $summary['failures'][] = [
@@ -330,7 +333,7 @@ collect() {
     write_empty_summary
     rm -f "$copy"
 
-    if ! kci-sandbox "$copy" "$out" -- head -c 67108864 "$name"; then
+    if ! ci-sandbox "$copy" "$out" -- head -c 67108864 "$name"; then
         return 0
     fi
 
@@ -339,7 +342,7 @@ collect() {
     fi
 }
 
-# Summarises the first report a command left in KCI_REPORT_DIR. The existence
+# Summarises the first report a command left in CI_REPORT_DIR. The existence
 # test only stats the name; collect does the reading.
 collect_report() {
     local report
@@ -375,7 +378,7 @@ build_payload() {
         read -r max_failures max_message max_annotations <<<"$tier"
 
         jq -n \
-            --arg id "$KCI_RUN_ID" \
+            --arg id "$CI_RUN_ID" \
             --arg status "$status" \
             --argjson duration "$SECONDS" \
             --arg phase "$last_log" \
@@ -418,16 +421,16 @@ report() {
     fi
 
     # 1. Nothing from the pull request may be alive once a secret is in use.
-    if ! kci-sandbox --reap; then
+    if ! ci-sandbox --reap; then
         say 'uid 2000 processes survived; results not sent'
         exit 1
     fi
 
     # 2. Only now mint the results token.
     build_payload
-    oidc_config kodizm-ci-results "$secret/results.curl"
+    oidc_config "$results_audience" "$secret/results.curl"
 
-    if ! kci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
+    if ! ci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
         rm -f "$secret/results.curl"
         say "results rejected (HTTP $(http_status "$state/results-response.json"))"
         exit 1
@@ -468,10 +471,10 @@ on_error() {
 exchange_token() {
     local repository
 
-    oidc_config kodizm-ci-token "$secret/oidc-token.curl"
-    jq -n --arg id "$KCI_RUN_ID" '{ci_run_id: $id}' >"$state/token-request.json"
+    oidc_config "$token_audience" "$secret/oidc-token.curl"
+    jq -n --arg id "$CI_RUN_ID" '{ci_run_id: $id}' >"$state/token-request.json"
 
-    if ! kci-post "$api/api/ci/token" "$secret/oidc-token.curl" "$secret/token.json" "$state/token-request.json"; then
+    if ! ci-post "$api/api/ci/token" "$secret/oidc-token.curl" "$secret/token.json" "$state/token-request.json"; then
         rm -f "$secret/oidc-token.curl"
         say "token exchange failed (HTTP $(http_status "$secret/token.json"))"
         return 1
@@ -482,7 +485,7 @@ exchange_token() {
     # shell, so its shape is checked before use. The token allows dots and
     # dashes: GitHub's stateless installation tokens carry a JWT after the
     # ghs_ prefix. The manifest is the repository's own file, relayed by
-    # kodizm.com, so it is checked here too. Only the names of failing fields
+    # the server, so it is checked here too. Only the names of failing fields
     # reach the public log, never a value.
     local bad
     bad="$(jq -r '
@@ -562,11 +565,11 @@ exchange_token() {
 
     # The server resolves the job from its check_run_id; a role or shard that
     # disagrees with this job's name means the two sides are out of step.
-    if [ "$role" != "${KCI_JOB_NAME%% (*}" ]; then
+    if [ "$role" != "${CI_JOB_NAME%% (*}" ]; then
         say 'the token response names another role than this job'
         return 1
     fi
-    if [[ "$KCI_JOB_NAME" =~ \(([0-9]+)\)$ ]] && [ "${BASH_REMATCH[1]}" != "$shard" ]; then
+    if [[ "$CI_JOB_NAME" =~ \(([0-9]+)\)$ ]] && [ "${BASH_REMATCH[1]}" != "$shard" ]; then
         say 'the token response names another shard than this job'
         return 1
     fi
@@ -582,7 +585,7 @@ exchange_token() {
 # helper stores it.
 git_with_token() {
     GIT_ASKPASS="$secret/askpass" \
-        KCI_GIT_TOKEN_FILE="$secret/github-token" \
+        CI_GIT_TOKEN_FILE="$secret/github-token" \
         GIT_TERMINAL_PROMPT=0 \
         git -C "$tree" -c credential.helper= "$@"
 }
@@ -592,7 +595,7 @@ fetch_source() {
 #!/bin/sh
 case "$1" in
     Username*) echo x-access-token ;;
-    *) cat "$KCI_GIT_TOKEN_FILE" ;;
+    *) cat "$CI_GIT_TOKEN_FILE" ;;
 esac
 SH
     chmod 0700 "$secret/askpass"
@@ -645,7 +648,7 @@ stage_scope_script() {
 
 # Without a scope script everything runs: php full, aux on, every file linted.
 # The script path is relative to the repository root, not to the manifest's
-# directory, the same place kodizm's ci-scope.sh has always run from. Main
+# directory, the same place a repository's own scope script has always run from. Main
 # mode runs the head's script (the default branch is trusted); pr mode runs
 # the copy stage_scope_script made, against the head tree.
 decide_scope() {
@@ -702,14 +705,14 @@ decide_scope() {
     # log is the list, so git's stderr stays out of it.
     if ! sandboxed changed-files "$tree" -- \
         sh -c "exec git -c core.quotePath=false diff --name-only --diff-filter=ACMR \"\$1\" HEAD 2>/dev/null" \
-        kci-diff "$pint_base"; then
+        ci-diff "$pint_base"; then
         say 'listing the changed files failed'
         return 1
     fi
 }
 
-# Lock file contents under the manifest's directory: run.yml restores the cache
-# under `kci-<namespace>-<stack>-<hash>` and falls back to the newest entry of
+# Lock file contents under the manifest's directory: ci.yml restores the cache
+# under `ci-<namespace>-<stack>-<hash>` and falls back to the newest entry of
 # the same namespace and stack, so one repository never restores another's.
 cache_key() {
     local workdir="$1"
@@ -744,7 +747,7 @@ prepare() {
     say 'prepare'
 
     # 1. Nothing may be running as uid 2000 while the tokens exist.
-    kci-sandbox --reap
+    ci-sandbox --reap
 
     # 2. Facts, manifest and token, then the source, then the token is gone.
     exchange_token
@@ -1013,12 +1016,12 @@ run_flutter_warm() {
 run_flutter_test() {
     local command
 
-    # The default expands inside the sandbox, from the KCI_* environment.
+    # The default expands inside the sandbox, from the CI_* environment.
     command="$(jq -r '.test.command // empty' "$state/stack.json")"
     if [ -z "$command" ]; then
         command="$(
             cat <<'SH'
-flutter test --total-shards "$KCI_SHARDS" --shard-index "$((KCI_SHARD - 1))" --file-reporter "json:$KCI_REPORT_DIR/flutter.json"
+flutter test --total-shards "$CI_SHARDS" --shard-index "$((CI_SHARD - 1))" --file-reporter "json:$CI_REPORT_DIR/flutter.json"
 SH
         )"
     fi
@@ -1061,7 +1064,7 @@ run() {
 
     # 1. The cache was restored by root; -h keeps a planted symlink from
     #    handing uid 2000 the file it points at.
-    kci-sandbox --reap
+    ci-sandbox --reap
     install -d -m 0700 -o "$sandbox_uid" -g "$sandbox_uid" "$out"
     install -d -m 0700 "$cache/composer" "$cache/npm" "$cache/pub"
     chown -R -h "$sandbox_uid:$sandbox_uid" "$cache"
@@ -1069,24 +1072,24 @@ run() {
     # 2. The environment every manifest command sees (names fixed by the
     #    manifest contract). The changed-file list is root's copy, read-only.
     sandbox_env=(
-        KCI_REPORT_DIR="$out"
+        CI_REPORT_DIR="$out"
     )
     if [ "$role" = test ] || [ "$role" = flutter-test ]; then
         sandbox_env+=(
-            KCI_SHARD="$shard"
-            KCI_SHARDS="$shards"
+            CI_SHARD="$shard"
+            CI_SHARDS="$shards"
         )
     fi
     if [ "$scoped" = true ]; then
         sandbox_env+=(
-            KCI_SCOPE_PHP="$php"
-            KCI_SCOPE_FILTER="$filter"
+            CI_SCOPE_PHP="$php"
+            CI_SCOPE_FILTER="$filter"
         )
     fi
     if [ -n "$pint_base" ]; then
         install -m 0644 "$state/changed-files.log" "$changed_files"
         sandbox_env+=(
-            KCI_CHANGED_FILES="$changed_files"
+            CI_CHANGED_FILES="$changed_files"
         )
     fi
     if [ "$stack" = flutter ]; then
@@ -1124,36 +1127,46 @@ main() {
     # image's tool directories (the Flutter SDK among them) are uid 2000's
     # PATH, never root's. Set here, not at file scope, so the test harness
     # that sources this file keeps its own PATH.
-    export PATH=/opt/kci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export PATH=/opt/ci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
     phase="${1:-}"
 
     case "$phase" in
         prepare | run) ;;
         *)
-            echo 'usage: kci-job prepare | run' >&2
+            echo 'usage: ci-job prepare | run' >&2
             exit 2
             ;;
     esac
 
     # The run id reaches a URL body and the token exchange, so it is checked
     # before anything touches the network.
-    if ! [[ "${KCI_RUN_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-        echo 'kci: KCI_RUN_ID is not a lowercase UUID' >&2
+    if ! [[ "${CI_RUN_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+        echo 'ci: CI_RUN_ID is not a lowercase UUID' >&2
         exit 2
     fi
 
-    if [ -z "${KCI_JOB_NAME:-}" ]; then
-        echo 'kci: KCI_JOB_NAME is empty' >&2
+    if [ -z "${CI_JOB_NAME:-}" ]; then
+        echo 'ci: CI_JOB_NAME is empty' >&2
         exit 2
     fi
+
+    # The server and both audiences are the pool's own; there is no default
+    # to fall back on, so a missing one stops the job before the network.
+    local required
+    for required in CI_API CI_TOKEN_AUDIENCE CI_RESULTS_AUDIENCE; do
+        if [ -z "${!required:-}" ]; then
+            echo "ci: $required is not set" >&2
+            exit 2
+        fi
+    done
 
     umask 077
     install -d -m 0711 "$root"
     install -d -m 0700 "$state" "$secret"
 
     # fd 3 is the public log; stdout and stderr of everything else go private.
-    # kci-sandbox closes fd 3 before it drops privileges.
+    # ci-sandbox closes fd 3 before it drops privileges.
     exec 3>&1
     exec >>"$state/$phase.log" 2>&1
 
@@ -1162,7 +1175,7 @@ main() {
     "$phase"
 }
 
-# Sourced by scripts/test/kci-job.test.sh for its pure helpers; run otherwise.
+# Sourced by scripts/test/ci-job.test.sh for its pure helpers; run otherwise.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main "$@"
 fi

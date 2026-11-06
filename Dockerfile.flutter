@@ -1,9 +1,9 @@
-# Job image for the Kodizm virtual CI of Flutter repositories, run by GitHub Actions as a `container:`.
+# Job image for the virtual CI of Flutter repositories, run by GitHub Actions as a `container:`.
 #
 # Same sandbox layout as the php image (Dockerfile): no USER directive because Actions needs
-# root to mount its workspace, and the scripts under /opt/kci drop to the unprivileged `ci`
+# root to mount its workspace, and the scripts under /opt/ci drop to the unprivileged `ci`
 # account (uid 2000) with setpriv before they touch anything that came from a pull request.
-# php-cli is here only for the root-side summariser inside kci-job; the Flutter suites never
+# php-cli is here only for the root-side summariser inside ci-job; the Flutter suites never
 # run PHP.
 #
 # trixie, not bookworm: icon checks (uptizm bin/sync-icons --check) compare librsvg renders with
@@ -39,7 +39,7 @@ RUN curl -fsSLo /tmp/flutter.tar.xz \
     && tar -C /opt --no-same-owner -xJf /tmp/flutter.tar.xz \
     && rm /tmp/flutter.tar.xz
 
-# A fresh HOME is created per run by kci-sandbox; the account exists so setpriv has a stable uid
+# A fresh HOME is created per run by ci-sandbox; the account exists so setpriv has a stable uid
 # to drop to.
 RUN useradd -u 2000 -m -s /bin/bash ci
 
@@ -59,7 +59,7 @@ RUN git config --system --add safe.directory /opt/flutter \
 
 # Explicit glob, not the whole directory: scripts/test holds the harness tests and must not ship.
 # COPY writes root-owned files, so a job running as `ci` cannot rewrite the code that sandboxes it.
-COPY --chmod=0755 scripts/kci-* /opt/kci/
+COPY --chmod=0755 scripts/ci-* /opt/ci/
 
-# /opt/flutter/bin is not here: kci-sandbox puts it on the PATH of the sandboxed child only.
-ENV PATH=/opt/kci:${PATH}
+# /opt/flutter/bin is not here: ci-sandbox puts it on the PATH of the sandboxed child only.
+ENV PATH=/opt/ci:${PATH}

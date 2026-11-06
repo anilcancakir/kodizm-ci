@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Checks kci-job's pure helpers without network or root: resolve_dir must
+# Checks ci-job's pure helpers without network or root: resolve_dir must
 # refuse every way out of the checkout, the summariser must turn a
 # `flutter test --file-reporter json:` log into the results payload, and pr
 # mode must stage the base commit's scope script, never the head's.
 #
-# usage: bash scripts/test/kci-job.test.sh   (macOS or Linux; needs php, jq, git)
+# usage: bash scripts/test/ci-job.test.sh   (macOS or Linux; needs php, jq, git)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,8 +20,8 @@ pass() {
     echo "ok: $1"
 }
 
-# shellcheck source=scripts/kci-job
-source "$here/../kci-job"
+# shellcheck source=scripts/ci-job
+source "$here/../ci-job"
 
 # Sourcing defines the functions and runs nothing; the globals they read are
 # pointed at the scratch directory, and fd 3 (the public log) at nowhere.
@@ -101,7 +101,7 @@ not a json line
 {"success":false,"type":"done","time":140}
 JSON
 
-KCI_RUN_ID=01234567-89ab-cdef-0123-456789abcdef
+CI_RUN_ID=01234567-89ab-cdef-0123-456789abcdef
 status=failed
 last_log='test'
 
@@ -146,8 +146,8 @@ printf '{"scope_script": ".github/scripts/ci-scope.sh"}\n' >"$state/stack.json"
 
 commit_all() {
     git -C "$tree" add -A
-    GIT_AUTHOR_NAME=kci GIT_AUTHOR_EMAIL=kci@example.invalid \
-        GIT_COMMITTER_NAME=kci GIT_COMMITTER_EMAIL=kci@example.invalid \
+    GIT_AUTHOR_NAME=ci GIT_AUTHOR_EMAIL=ci@example.invalid \
+        GIT_COMMITTER_NAME=ci GIT_COMMITTER_EMAIL=ci@example.invalid \
         git -C "$tree" -c commit.gpgsign=false commit --quiet -m "$1"
     git -C "$tree" rev-parse HEAD
 }
@@ -187,3 +187,33 @@ if [ -e "$scope_file" ]; then
     fail 'pr mode staged a scope script the base does not have'
 fi
 pass 'pr mode stages nothing when the base has no scope script'
+
+# 4. The API host and both audiences have no default: every pool names its
+#    own, so a missing one stops the job before anything touches the network.
+expect_unset_refused() {
+    local missing="$1"
+    local names=(CI_API CI_TOKEN_AUDIENCE CI_RESULTS_AUDIENCE)
+    local env_args=(
+        CI_RUN_ID=01234567-89ab-cdef-0123-456789abcdef
+        CI_JOB_NAME=lint
+    )
+    local name
+    local code=0
+    local stderr_file="$work/unset.stderr"
+
+    for name in "${names[@]}"; do
+        if [ "$name" != "$missing" ]; then
+            env_args+=("$name=https://example.invalid")
+        fi
+    done
+
+    env -i PATH="$PATH" "${env_args[@]}" bash "$here/../ci-job" prepare 2>"$stderr_file" || code=$?
+
+    [ "$code" -eq 2 ] || fail "ci-job exited $code without $missing, expected 2"
+    grep -qF "ci: $missing is not set" "$stderr_file" || fail "ci-job did not name $missing as missing"
+    pass "ci-job refuses to start without $missing"
+}
+
+expect_unset_refused CI_API
+expect_unset_refused CI_TOKEN_AUDIENCE
+expect_unset_refused CI_RESULTS_AUDIENCE

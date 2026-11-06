@@ -3,8 +3,8 @@
 # that account still owns. Everything a pull request ships (dependency
 # installs, tests, linters, repository scripts) goes through here.
 #
-# usage: kci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
-#        kci-sandbox --reap
+# usage: ci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+#        ci-sandbox --reap
 #
 # The child runs with:
 #   - uid and gid 2000, no supplementary groups, no capabilities (inheritable,
@@ -33,7 +33,7 @@
 # --postgres starts a throwaway PostgreSQL server inside the same sandbox
 # before the command: initdb and pg_ctl run as uid 2000 under the same env -i,
 # the data directory lives in the fresh HOME, and the server listens on the
-# Unix socket in /run/kci-postgres only (superuser postgres, trust auth,
+# Unix socket in /run/ci-postgres only (superuser postgres, trust auth,
 # database postgres, port 5432; PGHOST, PGPORT, PGUSER and PGDATABASE say so).
 # The server, and anything it starts (COPY TO PROGRAM), is uid 2000, so the
 # kill loop takes it down with the command.
@@ -46,7 +46,7 @@ set -euo pipefail
 # The child's PATH adds the image's SDK directories (Go and PostgreSQL in the
 # php image, Flutter in the flutter one), so a file uid 2000 manages to plant
 # in one of them only ever runs as uid 2000.
-root_path=/opt/kci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+root_path=/opt/ci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export PATH="$root_path"
 
 child_path=''
@@ -59,7 +59,7 @@ child_path+="$root_path"
 
 sandbox_uid=2000
 nproc_limit=4096
-postgres_socket_dir=/run/kci-postgres
+postgres_socket_dir=/run/ci-postgres
 
 # Runs as uid 2000 in front of the command. /run is root-only, so the socket
 # directory root prepares there cannot have been swapped for a symlink.
@@ -77,8 +77,8 @@ SH
 )"
 
 usage() {
-    echo 'usage: kci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]' >&2
-    echo '       kci-sandbox --reap' >&2
+    echo 'usage: ci-sandbox [--keep] [--postgres] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]' >&2
+    echo '       ci-sandbox --reap' >&2
     exit 2
 }
 
@@ -98,7 +98,7 @@ reap() {
 
         # pkill: 0 signalled something, 1 matched nothing, 2 or 3 is a failure.
         if [ "$status" -gt 1 ]; then
-            echo "kci-sandbox: pkill failed with status $status" >&2
+            echo "ci-sandbox: pkill failed with status $status" >&2
             return 125
         fi
 
@@ -111,7 +111,7 @@ reap() {
         fi
     done
 
-    echo 'kci-sandbox: uid 2000 processes survived the kill loop' >&2
+    echo 'ci-sandbox: uid 2000 processes survived the kill loop' >&2
     return 125
 }
 
@@ -137,7 +137,7 @@ lock_runner_dirs() {
 }
 
 if [ "$(id -u)" -ne 0 ]; then
-    echo 'kci-sandbox: must run as root' >&2
+    echo 'ci-sandbox: must run as root' >&2
     exit 2
 fi
 
@@ -186,7 +186,7 @@ lock_runner_dirs
 
 # 1. A fresh HOME per command: nothing one phase leaves in it (an .npmrc, a
 #    shell rc file, a planted binary) reaches the next.
-home="$(mktemp -d /tmp/kci-home.XXXXXXXX)"
+home="$(mktemp -d /tmp/ci-home.XXXXXXXX)"
 chown "$sandbox_uid:$sandbox_uid" "$home"
 chmod 0700 "$home"
 child_env+=("HOME=$home")
@@ -202,7 +202,7 @@ if [ "$postgres" = true ]; then
         PGUSER=postgres
         PGDATABASE=postgres
     )
-    set -- bash -c "$postgres_wrapper" kci-postgres "$@"
+    set -- bash -c "$postgres_wrapper" ci-postgres "$@"
 fi
 
 # 3. Run the child. The subshell stays root until setpriv, so it can open the

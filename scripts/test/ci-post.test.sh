@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Runs kci-post against router.php on a local `php -S` and checks that the
+# Runs ci-post against router.php on a local `php -S` and checks that the
 # bearer travels only as a request header, never in any process's argv, and
 # that 401, 429 and 503 are retried while 422 is not.
 #
-# usage: bash scripts/test/kci-post.test.sh   (macOS or Linux; needs php, curl)
+# usage: bash scripts/test/ci-post.test.sh   (macOS or Linux; needs php, curl)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-kci_post="$here/../kci-post"
+ci_post="$here/../ci-post"
 work="$(mktemp -d)"
 server_pid=''
 sampler_pid=''
@@ -41,7 +41,7 @@ start_server() {
 
     for attempt in 1 2 3 4 5; do
         port=$((20000 + RANDOM % 20000))
-        KCI_TEST_STATE="$work/state" php -S "127.0.0.1:$port" "$here/router.php" >"$work/server.log" 2>&1 &
+        CI_TEST_STATE="$work/state" php -S "127.0.0.1:$port" "$here/router.php" >"$work/server.log" 2>&1 &
         server_pid=$!
 
         for _ in $(seq 1 50); do
@@ -79,7 +79,7 @@ sample_argv() {
     done
 }
 
-token="kcitest-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+token="citest-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
 config="$work/auth.curl"
 (
     umask 077
@@ -87,8 +87,8 @@ config="$work/auth.curl"
 )
 printf '{"ci_run_id":"%s"}' "00000000-0000-4000-8000-000000000000" >"$work/body.json"
 
-if [ ! -x "$kci_post" ]; then
-    fail "kci-post is missing or not executable at $kci_post"
+if [ ! -x "$ci_post" ]; then
+    fail "ci-post is missing or not executable at $ci_post"
 fi
 
 start_server
@@ -97,10 +97,10 @@ sampler_pid=$!
 
 # 1. A 401, a 429 and a 503 are all retried until the 200 arrives.
 status=0
-stdout="$("$kci_post" "http://127.0.0.1:$port/sequence" "$config" "$work/response.json" "$work/body.json")" || status=$?
+stdout="$("$ci_post" "http://127.0.0.1:$port/sequence" "$config" "$work/response.json" "$work/body.json")" || status=$?
 
-[ "$status" -eq 0 ] || fail "kci-post exited $status on the retry sequence"
-[ -z "$stdout" ] || fail 'kci-post wrote to stdout'
+[ "$status" -eq 0 ] || fail "ci-post exited $status on the retry sequence"
+[ -z "$stdout" ] || fail 'ci-post wrote to stdout'
 [ "$(cat "$work/response.json")" = '{"ok":true}' ] || fail 'response body was not the final 200 body'
 [ "$(cat "$work/response.json.status")" = 200 ] || fail 'status file does not hold 200'
 [ "$(wc -l <"$work/state/authorization.log" | tr -d ' ')" -eq 4 ] || fail 'expected exactly 4 requests'
@@ -124,11 +124,16 @@ while IFS= read -r line; do
 done <"$work/state/body.log"
 pass 'every attempt was a JSON POST of the body file'
 
+while IFS= read -r line; do
+    [ "$line" = ci-job/1 ] || fail "a request had user agent '$line'"
+done <"$work/state/user-agent.log"
+pass 'every attempt carried the ci-job/1 user agent'
+
 # 2. A 422 is final: one request, non-zero exit, status recorded.
 status=0
-"$kci_post" "http://127.0.0.1:$port/reject" "$config" "$work/reject.json" "$work/body.json" || status=$?
+"$ci_post" "http://127.0.0.1:$port/reject" "$config" "$work/reject.json" "$work/body.json" || status=$?
 
-[ "$status" -ne 0 ] || fail 'kci-post exited 0 on a 422'
+[ "$status" -ne 0 ] || fail 'ci-post exited 0 on a 422'
 [ "$(cat "$work/reject.json.status")" = 422 ] || fail 'status file does not hold 422'
 [ "$(wc -l <"$work/state/authorization.log" | tr -d ' ')" -eq 5 ] || fail 'a 422 was retried'
 pass 'did not retry a 422'
@@ -137,7 +142,7 @@ touch "$work/stop"
 wait "$sampler_pid"
 sampler_pid=''
 
-# 3. The sampler must have seen kci-post's curl, or the argv check below
+# 3. The sampler must have seen ci-post's curl, or the argv check below
 # proves nothing.
 grep -q "curl.*127\.0\.0\.1:$port/sequence" "$work/argv.log" || fail 'the sampler never saw curl running'
 
@@ -146,4 +151,4 @@ if grep -qF -- "$token" "$work/argv.log"; then
 fi
 pass 'the bearer never appeared in any process argv'
 
-echo 'PASS kci-post.test.sh'
+echo 'PASS ci-post.test.sh'
