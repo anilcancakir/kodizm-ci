@@ -25,10 +25,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     container:
-      image: ghcr.io/kodizm/kodizm-ci:latest
+      # The same image and container options run.yml pins, so the probe proves
+      # the configuration that actually runs pull request code.
+      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
+      options: --init
     defaults:
       run:
         shell: bash
@@ -124,8 +127,8 @@ jobs:
             failed=true
           fi
 
-          # 5. No live uid 2000 process may survive (zombies run no code, and
-          #    PID 1 here never reaps them).
+          # 5. No live uid 2000 process may survive (zombies run no code and
+          #    are not counted).
           live="$(ps -A -o uid=,stat= | awk '$1 == 2000 && $2 !~ /^Z/ { n++ } END { print n + 0 }')"
           echo "probe: live uid 2000 processes after the sandbox: $live"
           if [ "$live" -ne 0 ]; then

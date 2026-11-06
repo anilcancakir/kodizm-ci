@@ -25,8 +25,8 @@
 # access; root in the container bypasses the mode.
 #
 # After the child exits, every live uid 2000 process is SIGKILLed until none
-# is left. Zombies are not counted: PID 1 in a job container is
-# `tail -f /dev/null`, which never reaps orphans, and a zombie runs no code.
+# is left. Zombies are not counted: a zombie runs no code, and a container
+# started without --init has `tail -f /dev/null` as PID 1, which never reaps.
 # --keep skips that kill; only the isolation probe uses it, to prove the
 # survivor check fails when a process is left behind.
 #
