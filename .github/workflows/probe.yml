@@ -201,7 +201,7 @@ jobs:
     timeout-minutes: 15
     container:
       # The flutter image run.yml pins, with the same container options.
-      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:4ec47ff5b03677fed50cbff781e9d83a60dfff38f63f2248110e10666e5c3bcf
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:9363caa989288855b1188cd19a19ffa553cc38046637c325b93ffc3d95329400
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
