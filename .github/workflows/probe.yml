@@ -314,7 +314,7 @@ jobs:
             failed=true
           fi
           if kci-sandbox /kciprobe/log/flutter-app.log "$app" FLUTTER_SUPPRESS_ANALYTICS=true \
-            -- bash -c 'flutter pub get && flutter analyze && flutter test'; then
+            PUB_CACHE=/kciprobe/out/pub-cache -- bash -c 'flutter pub get && flutter analyze && flutter test'; then
             echo 'probe: flutter pub get, analyze and test as uid 2000 ok'
           else
             echo 'probe: flutter pub get, analyze and test as uid 2000 FAILED'

@@ -37,19 +37,19 @@ RUN curl -fsSLo /tmp/flutter.tar.xz \
 # to drop to.
 RUN useradd -u 2000 -m -s /bin/bash ci
 
-# The SDK stays root-owned and unwritable by `ci`: a file planted in /opt/flutter/bin would be
-# resolved by anything that has it on PATH. Only bin/cache, where the Flutter tool takes its
-# lockfile and checks its stamps at run time, belongs to `ci`. The tool snapshot, the version file
-# and the artifacts are all made here at build time, so a job neither rebuilds the tool nor
-# downloads an engine. The safe.directory entry lets `ci` run git in the root-owned SDK checkout,
-# which the tool does to learn its own revision. Everything is made readable to `ci`: pub writes the
-# tool's package_config.json 0600, and `flutter create` reads it.
+# The SDK stays root-owned, readable but unwritable by `ci`: a file planted in /opt/flutter/bin
+# would be resolved by anything that has it on PATH. Only what the Flutter tool writes at run time
+# belongs to `ci`: bin/cache (its lockfile and stamps) and packages/flutter_tools/.dart_tool (pub
+# rewrites its package_config.json on every `flutter pub get`; probe.yml found it). The tool
+# snapshot, the version file and the artifacts are made here at build time, so a job neither
+# rebuilds the tool nor downloads an engine. The safe.directory entry lets `ci` run git in the
+# root-owned SDK checkout, which the tool does to learn its own revision.
 RUN git config --system --add safe.directory /opt/flutter \
     && /opt/flutter/bin/flutter config --no-analytics \
     && /opt/flutter/bin/flutter --version \
     && /opt/flutter/bin/flutter precache --no-android --no-ios \
     && chmod -R go-w,a+rX /opt/flutter \
-    && chown -R ci:ci /opt/flutter/bin/cache
+    && chown -R ci:ci /opt/flutter/bin/cache /opt/flutter/packages/flutter_tools/.dart_tool
 
 # Explicit glob, not the whole directory: scripts/test holds the harness tests and must not ship.
 # COPY writes root-owned files, so a job running as `ci` cannot rewrite the code that sandboxes it.
