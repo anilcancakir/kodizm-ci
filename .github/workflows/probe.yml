@@ -28,7 +28,7 @@ jobs:
     container:
       # The same image and container options run.yml pins, so the probe proves
       # the configuration that actually runs pull request code.
-      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
+      image: ghcr.io/kodizm/kodizm-ci@sha256:52a71d9d7247a53b182dfd6c486a80cadebcadba4e60a3b7eb21946dbbde3428
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}

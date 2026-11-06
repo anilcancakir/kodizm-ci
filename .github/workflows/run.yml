@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
+      image: ghcr.io/kodizm/kodizm-ci@sha256:52a71d9d7247a53b182dfd6c486a80cadebcadba4e60a3b7eb21946dbbde3428
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -71,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
+      image: ghcr.io/kodizm/kodizm-ci@sha256:52a71d9d7247a53b182dfd6c486a80cadebcadba4e60a3b7eb21946dbbde3428
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -106,7 +106,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
+      image: ghcr.io/kodizm/kodizm-ci@sha256:52a71d9d7247a53b182dfd6c486a80cadebcadba4e60a3b7eb21946dbbde3428
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -158,7 +158,7 @@ jobs:
           - shard: ${{ !contains(fromJSON(inputs.jobs), 'test-3') && 3 || 0 }}
           - shard: ${{ !contains(fromJSON(inputs.jobs), 'test-4') && 4 || 0 }}
     container:
-      image: ghcr.io/kodizm/kodizm-ci@sha256:00216c516ccf4942a6fe484db9b62d903d46f26f35687f8e99e20e50db8f5b80
+      image: ghcr.io/kodizm/kodizm-ci@sha256:52a71d9d7247a53b182dfd6c486a80cadebcadba4e60a3b7eb21946dbbde3428
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -191,7 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:c3644b05b0c77d1e9bc99f767636aae8ca174d3624ca4f8c4a4f03a2b4bd84b6
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -224,7 +224,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     container:
-      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:c3644b05b0c77d1e9bc99f767636aae8ca174d3624ca4f8c4a4f03a2b4bd84b6
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
@@ -275,7 +275,7 @@ jobs:
           - shard: ${{ !contains(fromJSON(inputs.jobs), 'flutter-test-3') && 3 || 0 }}
           - shard: ${{ !contains(fromJSON(inputs.jobs), 'flutter-test-4') && 4 || 0 }}
     container:
-      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:c3644b05b0c77d1e9bc99f767636aae8ca174d3624ca4f8c4a4f03a2b4bd84b6
       credentials:
         username: ${{ github.actor }}
         password: ${{ github.token }}
