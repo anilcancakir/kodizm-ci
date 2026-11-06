@@ -30,23 +30,29 @@ ARG FLUTTER_SHA256=25ed8c3c29d51a7353f2a944310b478af8214920639524b19c50a19e6c044
 RUN curl -fsSLo /tmp/flutter.tar.xz \
         "https://storage.googleapis.com/flutter_infra_release/releases/stable/linux/flutter_linux_${FLUTTER_VERSION}-stable.tar.xz" \
     && echo "${FLUTTER_SHA256}  /tmp/flutter.tar.xz" | sha256sum -c - \
-    && tar -C /opt -xJf /tmp/flutter.tar.xz \
+    && tar -C /opt --no-same-owner -xJf /tmp/flutter.tar.xz \
     && rm /tmp/flutter.tar.xz
 
 # A fresh HOME is created per run by kci-sandbox; the account exists so setpriv has a stable uid
 # to drop to.
 RUN useradd -u 2000 -m -s /bin/bash ci
 
-# The SDK is owned by `ci` because the Flutter tool writes its lock and stamp files inside it, and
-# its artifacts are fetched here at build time so a job never downloads an engine. The safe.directory
-# entry keeps git from refusing the checkout when a root-side step touches it.
+# The SDK stays root-owned and unwritable by `ci`: a file planted in /opt/flutter/bin would be
+# resolved by anything that has it on PATH. Only bin/cache, where the Flutter tool takes its
+# lockfile and checks its stamps at run time, belongs to `ci`. The tool snapshot, the version file
+# and the artifacts are all made here at build time, so a job neither rebuilds the tool nor
+# downloads an engine. The safe.directory entry lets `ci` run git in the root-owned SDK checkout,
+# which the tool does to learn its own revision.
 RUN git config --system --add safe.directory /opt/flutter \
     && /opt/flutter/bin/flutter config --no-analytics \
+    && /opt/flutter/bin/flutter --version \
     && /opt/flutter/bin/flutter precache --no-android --no-ios \
-    && chown -R ci:ci /opt/flutter
+    && chmod -R go-w /opt/flutter \
+    && chown -R ci:ci /opt/flutter/bin/cache
 
 # Explicit glob, not the whole directory: scripts/test holds the harness tests and must not ship.
 # COPY writes root-owned files, so a job running as `ci` cannot rewrite the code that sandboxes it.
 COPY --chmod=0755 scripts/kci-* /opt/kci/
 
-ENV PATH=/opt/kci:/opt/flutter/bin:${PATH}
+# /opt/flutter/bin is not here: kci-sandbox puts it on the PATH of the sandboxed child only.
+ENV PATH=/opt/kci:${PATH}

@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Checks kci-job's pure helpers without network or root: resolve_dir must
-# refuse every way out of the checkout, and the summariser must turn a
-# `flutter test --file-reporter json:` log into the results payload.
+# refuse every way out of the checkout, the summariser must turn a
+# `flutter test --file-reporter json:` log into the results payload, and pr
+# mode must stage the base commit's scope script, never the head's.
 #
-# usage: bash scripts/test/kci-job.test.sh   (macOS or Linux; needs php, jq)
+# usage: bash scripts/test/kci-job.test.sh   (macOS or Linux; needs php, jq, git)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -134,3 +135,55 @@ if ! jq -e '.ci_run_id == "01234567-89ab-cdef-0123-456789abcdef" and .status == 
     fail 'the payload lost the run id or the status'
 fi
 pass 'payload carries the run id and the status'
+
+# 3. The scope script in pr mode is the base commit's, never the head's: a
+#    pull request must not be able to rewrite the rules that judge it.
+tree="$work/repo"
+scope_file="$work/scope-script"
+stack=laravel
+mkdir -p "$tree/.github/scripts"
+printf '{"scope_script": ".github/scripts/ci-scope.sh"}\n' >"$state/stack.json"
+
+commit_all() {
+    git -C "$tree" add -A
+    GIT_AUTHOR_NAME=kci GIT_AUTHOR_EMAIL=kci@example.invalid \
+        GIT_COMMITTER_NAME=kci GIT_COMMITTER_EMAIL=kci@example.invalid \
+        git -C "$tree" -c commit.gpgsign=false commit --quiet -m "$1"
+    git -C "$tree" rev-parse HEAD
+}
+
+git init --quiet "$tree"
+printf 'echo php=full\n' >"$tree/.github/scripts/ci-scope.sh"
+base_sha="$(commit_all base)"
+printf 'echo php=none\n' >"$tree/.github/scripts/ci-scope.sh"
+head_sha="$(commit_all head)"
+
+mode='pr'
+stage_scope_script
+if [ "$(cat "$scope_file" 2>/dev/null)" != 'echo php=full' ]; then
+    fail 'pr mode did not stage the base commit scope script'
+fi
+pass 'pr mode stages the base commit scope script'
+
+mode=main
+stage_scope_script
+if [ -e "$scope_file" ]; then
+    fail 'main mode staged a scope script'
+fi
+pass 'main mode leaves the head scope script in place'
+
+mode='pr'
+base_sha=''
+stage_scope_script
+if [ -e "$scope_file" ]; then
+    fail 'pr mode without a base staged a scope script'
+fi
+pass 'pr mode without a base stages nothing'
+
+git -C "$tree" rm --quiet .github/scripts/ci-scope.sh
+base_sha="$(commit_all without-script)"
+stage_scope_script
+if [ -e "$scope_file" ]; then
+    fail 'pr mode staged a scope script the base does not have'
+fi
+pass 'pr mode stages nothing when the base has no scope script'

@@ -7,9 +7,10 @@
 #          repository's manifest block for this job's stack and a short-lived
 #          installation token, fetches the private head and base commits with
 #          it, revokes it, resolves the manifest's directory, lets the
-#          repository's own scope script decide the scope (as uid 2000),
-#          removes .git, and writes cache_key, cache_scope and mode to
-#          $GITHUB_OUTPUT. run.yml then restores the dependency cache into
+#          repository's own scope script decide the scope (as uid 2000; in pr
+#          mode the base commit's copy of it), removes .git, and writes
+#          cache_key, cache_scope and mode to $GITHUB_OUTPUT (masked). run.yml
+#          then restores the dependency cache into
 #          /kci/cache, before any pull request code has run.
 # run      installs dependencies and runs the role's manifest commands as uid
 #          2000 through kci-sandbox, kills every uid 2000 process, and only then
@@ -48,6 +49,7 @@ tree="$root/tree"
 out="$root/out"
 cache="$root/cache"
 changed_files="$root/changed-files"
+scope_file="$root/scope-script"
 sandbox_uid=2000
 api="${KCI_API:-https://kodizm.com}"
 api="${api%/}"
@@ -615,11 +617,40 @@ scope_value() {
         "$state/scope.log"
 }
 
+# In pr mode the head commit is the pull request's own code, so its scope
+# script could skip every test. Root copies the base commit's version to a
+# root-owned file uid 2000 can read, while root still owns .git (git refuses a
+# repository another account owns) and before any repository code has run.
+# Stages nothing in main mode, without a fetched base, or when the base has
+# no such script; decide_scope then runs everything.
+stage_scope_script() {
+    local scope_script
+
+    rm -f "$scope_file"
+
+    scope_script="$(jq -r '.scope_script // ""' "$state/stack.json")"
+    if [ "$mode" != pr ] || [ "$stack" != laravel ] || [ -z "$scope_script" ]; then
+        return 0
+    fi
+    if ! [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] || [[ "$base_sha" =~ ^0+$ ]]; then
+        return 0
+    fi
+
+    if ! git -C "$tree" cat-file blob "$base_sha:$scope_script" >"$scope_file"; then
+        rm -f "$scope_file"
+        return 0
+    fi
+    chmod 0644 "$scope_file"
+}
+
 # Without a scope script everything runs: php full, aux on, every file linted.
 # The script path is relative to the repository root, not to the manifest's
-# directory, the same place kodizm's ci-scope.sh has always run from.
+# directory, the same place kodizm's ci-scope.sh has always run from. Main
+# mode runs the head's script (the default branch is trusted); pr mode runs
+# the copy stage_scope_script made, against the head tree.
 decide_scope() {
     local scope_script
+    local scope_command
 
     scoped=false
     gateway=true
@@ -633,7 +664,16 @@ decide_scope() {
     fi
     scoped=true
 
-    if ! sandboxed scope "$tree" -- bash "./$scope_script" "$base_sha" "$head_sha" "$mode"; then
+    if [ "$mode" = main ]; then
+        scope_command=(bash "./$scope_script")
+    elif [ -f "$scope_file" ]; then
+        scope_command=(bash "$scope_file")
+    else
+        say 'no scope script on the base commit; everything runs'
+        return 0
+    fi
+
+    if ! sandboxed scope "$tree" -- "${scope_command[@]}" "$base_sha" "$head_sha" "$mode"; then
         say 'the scope script failed'
         return 1
     fi
@@ -643,7 +683,8 @@ decide_scope() {
     filter="$(scope_value filter)"
     pint_base="$(scope_value pint_base)"
 
-    # The scope script is code from the head commit, so its answer is untrusted.
+    # The script reads the head tree (pull request code), so its answer is
+    # untrusted.
     if ! [[ "$gateway" =~ ^(true|false)$ ]] \
         || ! [[ "$php" =~ ^(none|docs|affected|full)$ ]] \
         || ! [[ "$filter" =~ ^[A-Za-z0-9_|]*$ ]] \
@@ -711,13 +752,15 @@ prepare() {
     revoke_token
     say "mode=$mode"
 
-    # 3. Root resolves the manifest's directory and hashes the lock files
-    #    before any repository code has run.
+    # 3. Root resolves the manifest's directory, hashes the lock files and
+    #    stages the base commit's scope script before any repository code has
+    #    run.
     if ! workdir="$(resolve_dir "$tree" "$dir")"; then
         say 'the manifest directory is not usable'
         return 1
     fi
     key="$(cache_key "$workdir")"
+    stage_scope_script
 
     # 4. The repository's own scope rules run as uid 2000, after revocation.
     #    -h: a symlink in the checkout is re-owned itself, never its target.
@@ -750,7 +793,9 @@ prepare() {
         }' \
         >"$state/job.json"
 
-    # 5. The namespace is opaque, and actions/cache needs it for the key.
+    # 5. actions/cache needs the namespace for the key, and logs the key it
+    #    restores; masked first, so the public log shows *** in its place.
+    printf '::add-mask::%s\n' "$cache_namespace" "$key" >&3
     printf 'cache_key=%s\ncache_scope=%s-%s\nmode=%s\n' "$key" "$cache_namespace" "$stack" "$mode" \
         >>"${GITHUB_OUTPUT:?}"
     say 'prepared'
@@ -1075,6 +1120,12 @@ run() {
 }
 
 main() {
+    # Root resolves every command from root-owned directories only: the
+    # image's tool directories (the Flutter SDK among them) are uid 2000's
+    # PATH, never root's. Set here, not at file scope, so the test harness
+    # that sources this file keeps its own PATH.
+    export PATH=/opt/kci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
     phase="${1:-}"
 
     case "$phase" in

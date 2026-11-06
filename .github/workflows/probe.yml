@@ -4,8 +4,11 @@ name: Isolation probe
 # uid 2000 cannot read a secret root holds, cannot write the runner's file
 # commands or step summary, cannot reach the runner's workflow command parser,
 # and leaves no process behind, not even one a sandboxed PostgreSQL server
-# started (COPY TO PROGRAM). The public log shows only the secret's sha256
-# and one line per check; the probe's own output stays in a root-only file.
+# started (COPY TO PROGRAM). The flutter job proves the same image property
+# for the Flutter image: uid 2000 cannot plant a file in the SDK's bin or on
+# root's PATH, root resolves its tools outside the SDK, and the Flutter tool
+# still works as uid 2000. The public log shows only the secret's sha256 and
+# one line per check; the probe's own output stays in a root-only file.
 on:
   workflow_dispatch:
     inputs:
@@ -184,6 +187,105 @@ jobs:
           live="$(ps -A -o uid=,stat= | awk '$1 == 2000 && $2 !~ /^Z/ { n++ } END { print n + 0 }')"
           echo "probe: live uid 2000 processes after the reap: $live"
           if [ "$live" -ne 0 ]; then
+            failed=true
+          fi
+
+          if [ "$failed" = true ]; then
+            echo 'probe: FAILED'
+            exit 1
+          fi
+          echo 'probe: passed'
+
+  flutter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      # The flutter image run.yml pins, with the same container options.
+      image: ghcr.io/kodizm/kodizm-ci-flutter@sha256:c3644b05b0c77d1e9bc99f767636aae8ca174d3624ca4f8c4a4f03a2b4bd84b6
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+      options: --init
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Probe the Flutter SDK and root's PATH
+        run: |
+          umask 077
+          failed=false
+          install -d -m 0711 /kciprobe
+          install -d -m 0700 /kciprobe/log
+          install -d -m 0700 -o 2000 -g 2000 /kciprobe/out
+          report=/kciprobe/out/flutter-report
+
+          # 1. uid 2000 tries to plant a file in the SDK and in every directory
+          #    on root's PATH; root then looks for one itself.
+          probe_status=0
+          kci-sandbox /kciprobe/log/flutter-probe.log /kciprobe/out \
+            -- kci-probe --flutter "$report" || probe_status=$?
+          echo "probe: kci-sandbox --flutter exited $probe_status"
+          if [ "$probe_status" -ne 0 ]; then
+            failed=true
+          fi
+
+          if grep -qx 'flutter_sdk_write=blocked' "$report"; then
+            echo 'probe: uid 2000 cannot write /opt/flutter/bin'
+          else
+            echo 'probe: uid 2000 CAN write /opt/flutter or /opt/flutter/bin'
+            failed=true
+          fi
+          if grep -qx 'root_path_write=blocked' "$report"; then
+            echo "probe: uid 2000 cannot write any directory on root's PATH"
+          else
+            echo "probe: uid 2000 CAN write a directory on root's PATH"
+            failed=true
+          fi
+          for dir in /opt/flutter /opt/flutter/bin /opt/kci /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+            if [ -e "$dir/kciprobe-planted" ]; then
+              echo "probe: a file was planted in $dir"
+              failed=true
+            fi
+          done
+
+          # 2. Root's own PATH holds nothing of the SDK, and every tool the
+          #    root side of kci-job and kci-sandbox runs resolves outside it.
+          case ":$PATH:" in
+            *:/opt/flutter*)
+              echo "probe: root's PATH holds the Flutter SDK"
+              failed=true
+              ;;
+          esac
+          for tool in realpath setpriv pkill jq php curl; do
+            if ! resolved="$(command -v "$tool")"; then
+              echo "probe: root cannot resolve $tool"
+              failed=true
+            elif [[ "$resolved" == /opt/flutter/* ]]; then
+              echo "probe: root resolves $tool inside /opt/flutter"
+              failed=true
+            else
+              echo "probe: root resolves $tool to $resolved, outside /opt/flutter"
+            fi
+          done
+
+          # 3. The tool still works as uid 2000 with only bin/cache its own:
+          #    its version, then a fresh app through analyze and test, the
+          #    commands the flutter roles run. The log is printed on a failure
+          #    so the directory the tool could not write is named.
+          if kci-sandbox /kciprobe/log/flutter-version.log /kciprobe/out FLUTTER_SUPPRESS_ANALYTICS=true \
+            -- flutter --version; then
+            echo 'probe: flutter --version as uid 2000 ok'
+          else
+            echo 'probe: flutter --version as uid 2000 FAILED'
+            tail -n 40 /kciprobe/log/flutter-version.log
+            failed=true
+          fi
+          if kci-sandbox /kciprobe/log/flutter-app.log /kciprobe/out FLUTTER_SUPPRESS_ANALYTICS=true \
+            -- bash -c 'flutter create --project-name kciprobe app && cd app && flutter analyze && flutter test'; then
+            echo 'probe: flutter create, analyze and test as uid 2000 ok'
+          else
+            echo 'probe: flutter create, analyze and test as uid 2000 FAILED'
+            tail -n 40 /kciprobe/log/flutter-app.log
             failed=true
           fi
 

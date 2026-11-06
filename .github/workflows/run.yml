@@ -184,7 +184,6 @@ jobs:
           KCI_JOB_NAME: test (${{ matrix.shard }})
         run: kci-job run
 
-  # The flutter image digest is a placeholder until its first build is pinned.
   flutter-lint:
     name: flutter-lint
     if: contains(fromJSON(inputs.jobs), 'flutter-lint')

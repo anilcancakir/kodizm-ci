@@ -10,10 +10,10 @@
 #   - uid and gid 2000, no supplementary groups, no capabilities (inheritable,
 #     ambient and bounding sets emptied), no_new_privs so no setuid binary can
 #     give any back (setpriv);
-#   - an environment of PATH, LANG, CI, a fresh HOME and the given NAME=VALUE
-#     pairs only (env -i), so the runner's ACTIONS_* tokens and the
-#     GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH and GITHUB_STEP_SUMMARY paths
-#     are absent;
+#   - an environment of PATH (child_path below), LANG, CI, a fresh HOME and
+#     the given NAME=VALUE pairs only (env -i), so the runner's ACTIONS_*
+#     tokens and the GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH and
+#     GITHUB_STEP_SUMMARY paths are absent;
 #   - stdin from /dev/null, stdout and stderr appended to <log-file> (created
 #     0600 by root) and no other file descriptor, so a workflow command it
 #     prints never reaches the runner, which parses only the step's own stdout
@@ -41,6 +41,21 @@
 # Exits with the child's status, or 125 when uid 2000 processes survive the
 # kill loop. --reap runs the kill loop alone (0, or 125 on survivors).
 set -euo pipefail
+
+# Root resolves pkill, setpriv and the rest from root-owned directories only.
+# The child's PATH adds the image's SDK directories (Go and PostgreSQL in the
+# php image, Flutter in the flutter one), so a file uid 2000 manages to plant
+# in one of them only ever runs as uid 2000.
+root_path=/opt/kci:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH="$root_path"
+
+child_path=''
+for tool_dir in /usr/local/go/bin /usr/lib/postgresql/*/bin /opt/flutter/bin; do
+    if [ -d "$tool_dir" ]; then
+        child_path+="$tool_dir:"
+    fi
+done
+child_path+="$root_path"
 
 sandbox_uid=2000
 nproc_limit=4096
@@ -150,7 +165,7 @@ workdir="$2"
 shift 2
 
 child_env=(
-    "PATH=$PATH"
+    "PATH=$child_path"
     LANG=C.UTF-8
     CI=true
 )

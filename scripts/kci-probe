@@ -7,6 +7,11 @@
 #
 # usage: kci-probe <report-file>
 #        kci-probe --postgres <report-file>
+#        kci-probe --flutter <report-file>
+#
+# --flutter runs in the flutter image and records whether uid 2000 can write
+# /opt/flutter or /opt/flutter/bin (flutter_sdk_write) or any directory on
+# root's PATH (root_path_write); both must be blocked.
 #
 # --postgres runs under `kci-sandbox --keep --postgres`, so initdb and pg_ctl
 # have already run as uid 2000. It records whether `select 1` answers
@@ -25,12 +30,14 @@
 set -euo pipefail
 
 probe_mode=sandbox
-if [ "${1:-}" = --postgres ]; then
-    probe_mode=postgres
-    shift
-fi
+case "${1:-}" in
+    --postgres | --flutter)
+        probe_mode="${1#--}"
+        shift
+        ;;
+esac
 
-report="${1:?usage: kci-probe [--postgres] <report-file>}"
+report="${1:?usage: kci-probe [--postgres | --flutter] <report-file>}"
 secret_pattern='kciprobe-[0-9a-f]{32}'
 self_uid="$(id -u)"
 
@@ -64,12 +71,44 @@ probe_postgres() {
     fi
 }
 
+# Root resolves its commands from these directories, and the sandboxed child
+# resolves flutter and dart from /opt/flutter/bin. A file planted in any of
+# them would run as whoever finds it first, so none may take a write.
+probe_flutter() {
+    local dir
+    local sdk_write=false
+    local root_path_write=false
+
+    for dir in /opt/flutter /opt/flutter/bin; do
+        if { : >"$dir/kciprobe-planted"; } 2>/dev/null; then
+            sdk_write=true
+        fi
+    done
+    if { : >>/opt/flutter/bin/flutter; } 2>/dev/null; then
+        sdk_write=true
+    fi
+    verdict flutter_sdk_write "$sdk_write"
+
+    for dir in /opt/kci /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        if { : >"$dir/kciprobe-planted"; } 2>/dev/null; then
+            root_path_write=true
+        fi
+    done
+    verdict root_path_write "$root_path_write"
+}
+
 : >"$report"
 
-if [ "$probe_mode" = postgres ]; then
-    probe_postgres
-    exit 0
-fi
+case "$probe_mode" in
+    postgres)
+        probe_postgres
+        exit 0
+        ;;
+    flutter)
+        probe_flutter
+        exit 0
+        ;;
+esac
 
 # 1. Process environments: the secret, the OIDC request token, and any other
 #    account's environ at all (the kernel gates it behind ptrace access).
