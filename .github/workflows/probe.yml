@@ -269,9 +269,42 @@ jobs:
           done
 
           # 3. The tool still works as uid 2000 with only bin/cache its own:
-          #    its version, then a fresh app through analyze and test, the
-          #    commands the flutter roles run. The log is printed on a failure
-          #    so the directory the tool could not write is named.
+          #    its version, then a minimal app through the commands the
+          #    flutter roles run (pub get, analyze, a widget test). The app is
+          #    written by hand: `flutter create` runs pub inside the SDK's own
+          #    flutter_tools package, which no role does. The log is printed on
+          #    a failure so the path the tool could not write is named.
+          app=/kciprobe/out/app
+          mkdir -p "$app/lib" "$app/test"
+          printf '%s\n' \
+            'name: kciprobe' \
+            'environment:' \
+            '  sdk: ^3.0.0' \
+            'dependencies:' \
+            '  flutter:' \
+            '    sdk: flutter' \
+            'dev_dependencies:' \
+            '  flutter_test:' \
+            '    sdk: flutter' \
+            >"$app/pubspec.yaml"
+          printf '%s\n' \
+            "import 'package:flutter/widgets.dart';" \
+            '' \
+            "Widget probe() => const Directionality(textDirection: TextDirection.ltr, child: Text('kci'));" \
+            >"$app/lib/main.dart"
+          printf '%s\n' \
+            "import 'package:flutter_test/flutter_test.dart';" \
+            "import 'package:kciprobe/main.dart';" \
+            '' \
+            'void main() {' \
+            "  testWidgets('renders', (tester) async {" \
+            '    await tester.pumpWidget(probe());' \
+            "    expect(find.text('kci'), findsOneWidget);" \
+            '  });' \
+            '}' \
+            >"$app/test/probe_test.dart"
+          chown -R 2000:2000 "$app"
+
           if kci-sandbox /kciprobe/log/flutter-version.log /kciprobe/out FLUTTER_SUPPRESS_ANALYTICS=true \
             -- flutter --version; then
             echo 'probe: flutter --version as uid 2000 ok'
@@ -280,11 +313,11 @@ jobs:
             tail -n 40 /kciprobe/log/flutter-version.log
             failed=true
           fi
-          if kci-sandbox /kciprobe/log/flutter-app.log /kciprobe/out FLUTTER_SUPPRESS_ANALYTICS=true \
-            -- bash -c 'flutter create --project-name kciprobe app && cd app && flutter analyze && flutter test'; then
-            echo 'probe: flutter create, analyze and test as uid 2000 ok'
+          if kci-sandbox /kciprobe/log/flutter-app.log "$app" FLUTTER_SUPPRESS_ANALYTICS=true \
+            -- bash -c 'flutter pub get && flutter analyze && flutter test'; then
+            echo 'probe: flutter pub get, analyze and test as uid 2000 ok'
           else
-            echo 'probe: flutter create, analyze and test as uid 2000 FAILED'
+            echo 'probe: flutter pub get, analyze and test as uid 2000 FAILED'
             tail -n 40 /kciprobe/log/flutter-app.log
             failed=true
           fi
