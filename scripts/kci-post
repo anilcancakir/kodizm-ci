@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Sends one HTTP request whose credentials live in a curl config file, and
+# retries while kodizm.com or GitHub is briefly unable to answer it.
+#
+# usage: kci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]
+#
+# <config-file>   curl config lines such as `header = "Authorization: Bearer ..."`,
+#                 mode 0600. A bearer on the command line would sit in
+#                 /proc/<pid>/cmdline, which every local user can read.
+# <response-file> receives the final response body; <response-file>.status
+#                 receives its HTTP status code (000 when nothing came back).
+# <body-file>     sent as JSON; the method defaults to POST with a body and to
+#                 GET without one.
+#
+# Retries: 401 up to 3 times (a run id the server stored a moment ago may not
+# be visible yet), 429 and 503 after their Retry-After seconds within 300 s in
+# total, other 5xx and transport failures up to 3 times. Exits 0 on a 2xx and
+# 1 otherwise. Prints nothing on stdout.
+set -euo pipefail
+
+usage() {
+    echo 'usage: kci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]' >&2
+    exit 2
+}
+
+method=''
+if [ "${1:-}" = -X ]; then
+    method="${2:-}"
+    shift 2 || usage
+fi
+
+if [ $# -lt 3 ] || [ $# -gt 4 ]; then
+    usage
+fi
+
+url="$1"
+config="$2"
+response="$3"
+body="${4:-}"
+headers="$response.headers"
+
+curl_args=(
+    --config "$config"
+    --silent
+    --show-error
+    --max-time 60
+    --dump-header "$headers"
+    --output "$response"
+    --write-out '%{http_code}'
+)
+
+if [ -n "$body" ]; then
+    method="${method:-POST}"
+    curl_args+=(
+        --header 'Content-Type: application/json'
+        --data-binary "@$body"
+    )
+fi
+
+curl_args+=(
+    --request "${method:-GET}"
+    --url "$url"
+)
+
+max_unauthorized=3
+max_server_errors=3
+wait_budget=300
+
+unauthorized=0
+server_errors=0
+waited=0
+
+# Delta-seconds from the last Retry-After header; an HTTP date or a missing
+# header falls back to 5 seconds.
+retry_after() {
+    local value
+
+    value="$(tr -d '\r' <"$headers" | awk 'tolower($1) == "retry-after:" { v = $2 } END { print v }')"
+
+    if [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -gt 0 ]; then
+        echo "$value"
+    else
+        echo 5
+    fi
+}
+
+finish() {
+    printf '%s\n' "$1" >"$response.status"
+    rm -f "$headers"
+
+    if [[ "$1" =~ ^2[0-9][0-9]$ ]]; then
+        exit 0
+    fi
+
+    exit 1
+}
+
+while :; do
+    : >"$headers"
+
+    # curl prints 000 and exits non-zero when no response arrived; that case is
+    # retried below like a 5xx, and curl's own message is already on stderr.
+    if ! code="$(curl -q "${curl_args[@]}")"; then
+        code=000
+    fi
+
+    case "$code" in
+        2??)
+            finish "$code"
+            ;;
+        401)
+            if [ "$unauthorized" -ge "$max_unauthorized" ]; then
+                finish "$code"
+            fi
+            unauthorized=$((unauthorized + 1))
+            sleep 2
+            ;;
+        429 | 503)
+            delay="$(retry_after)"
+            if [ $((waited + delay)) -gt "$wait_budget" ]; then
+                finish "$code"
+            fi
+            waited=$((waited + delay))
+            sleep "$delay"
+            ;;
+        000 | 5??)
+            if [ "$server_errors" -ge "$max_server_errors" ]; then
+                finish "$code"
+            fi
+            server_errors=$((server_errors + 1))
+            sleep 5
+            ;;
+        *)
+            finish "$code"
+            ;;
+    esac
+done

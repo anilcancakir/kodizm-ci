@@ -1,0 +1,730 @@
+#!/usr/bin/env bash
+# One Kodizm virtual CI job, in the two steps run.yml calls:
+#
+# usage: kci-job prepare | run
+#
+# prepare  trades an OIDC token (aud kodizm-ci-token) for the job's facts and a
+#          short-lived installation token, fetches the private head and base
+#          commits with it, revokes it, lets the repository's own ci-scope.sh
+#          decide the scope (as uid 2000), removes .git, and writes cache_key
+#          and mode to $GITHUB_OUTPUT. run.yml then restores the dependency
+#          cache into /kci/cache, before any pull request code has run.
+# run      installs dependencies and runs the role command as uid 2000 through
+#          kci-sandbox, kills every uid 2000 process, and only then fetches a
+#          fresh OIDC token (aud kodizm-ci-results) to post the results. It
+#          posts on a failed command (status failed) and on an internal error
+#          (status errored) too.
+#
+# Environment: KCI_RUN_ID (lowercase UUID), KCI_JOB_NAME (`lint`, `test (2)`),
+# KCI_API (default https://kodizm.com) and the runner's
+# ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN (job permission id-token: write).
+#
+# The public log gets fixed `kci:` lines only. Every command's own output goes
+# to root-only logs under /kci/state, because an error message (git's, jq's)
+# can quote the private repository name or a token. No secret is ever an
+# argument: curl reads headers from 0600 config files, git reads the token
+# through GIT_ASKPASS.
+#
+# Exits 0 once kodizm.com accepted the results, whatever their status, so the
+# public run carries no verdict on private code; 1 when they were not
+# delivered or prepare failed.
+set -Eeuo pipefail
+
+root=/kci
+state="$root/state"
+secret="$root/secret"
+tree="$root/tree"
+out="$root/out"
+cache="$root/cache"
+sandbox_uid=2000
+api="${KCI_API:-https://kodizm.com}"
+api="${api%/}"
+
+phase="${1:-}"
+status=errored
+last_log=''
+reporting=false
+sandbox_env=()
+
+case "$phase" in
+    prepare | run) ;;
+    *)
+        echo 'usage: kci-job prepare | run' >&2
+        exit 2
+        ;;
+esac
+
+# The run id reaches a URL body and the token exchange, so it is checked
+# before anything touches the network.
+if ! [[ "${KCI_RUN_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+    echo 'kci: KCI_RUN_ID is not a lowercase UUID' >&2
+    exit 2
+fi
+
+if [ -z "${KCI_JOB_NAME:-}" ]; then
+    echo 'kci: KCI_JOB_NAME is empty' >&2
+    exit 2
+fi
+
+umask 077
+install -d -m 0711 "$root"
+install -d -m 0700 "$state" "$secret"
+
+# fd 3 is the public log; stdout and stderr of everything else go private.
+# kci-sandbox closes fd 3 before it drops privileges.
+exec 3>&1
+exec >>"$state/$phase.log" 2>&1
+
+say() {
+    printf 'kci: %s\n' "$1" >&3
+}
+
+http_status() {
+    cat "$1.status" 2>/dev/null || echo 000
+}
+
+# usage: sandboxed <log-name> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+sandboxed() {
+    local name="$1"
+    local workdir="$2"
+    shift 2
+
+    last_log="$name"
+    kci-sandbox "$state/$name.log" "$workdir" "${sandbox_env[@]}" "$@"
+}
+
+# Writes a curl config carrying a fresh OIDC token for <audience>. The runner's
+# request token goes to one 0600 config, the JWT it returns to another.
+oidc_config() {
+    local audience="$1"
+    local config="$2"
+    local request_token="${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}"
+
+    if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || ! [[ "$request_token" =~ ^[A-Za-z0-9._~+/=-]+$ ]]; then
+        say 'no OIDC request token; the job needs permission id-token: write'
+        return 1
+    fi
+
+    printf 'header = "Authorization: Bearer %s"\n' "$request_token" >"$secret/oidc-request.curl"
+
+    if ! kci-post "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$audience" "$secret/oidc-request.curl" "$secret/oidc.json"; then
+        say "OIDC token request failed (HTTP $(http_status "$secret/oidc.json"))"
+        rm -f "$secret/oidc-request.curl" "$secret/oidc.json"
+        return 1
+    fi
+
+    jq -er '
+        .value
+        | select(type == "string" and test("^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"))
+        | "header = \"Authorization: Bearer \(.)\"\nheader = \"Accept: application/json\""
+    ' "$secret/oidc.json" >"$config"
+
+    rm -f "$secret/oidc-request.curl" "$secret/oidc.json" "$secret/oidc.json.status"
+}
+
+revoke_token() {
+    local revoked=true
+
+    if [ ! -f "$secret/github.curl" ]; then
+        return 0
+    fi
+
+    if ! kci-post -X DELETE https://api.github.com/installation/token "$secret/github.curl" "$state/revoke.json"; then
+        revoked=false
+    fi
+
+    rm -f "$secret/github.curl" "$secret/github-token" "$secret/askpass" "$secret/token.json"
+
+    if [ "$revoked" = false ]; then
+        say "installation token revocation failed (HTTP $(http_status "$state/revoke.json"))"
+        return 1
+    fi
+}
+
+write_empty_summary() {
+    jq -n '{counts: {tests: 0, failures: 0, errors: 0, skipped: 0}, failures: [], annotations: []}' \
+        >"$state/summary.json"
+}
+
+# Turns a JUnit XML or Pint JSON file into {counts, failures, annotations}.
+# The file came out of the sandbox, so it is parsed as data only: no network,
+# no entity expansion beyond libxml's defaults, invalid UTF-8 substituted.
+summarise() {
+    php -d memory_limit=1G -- "$1" "$2" "$tree/" >"$state/summary.json" <<'PHP'
+<?php
+
+[, $kind, $file, $prefix] = $argv;
+
+$relative = static fn (string $path): string => str_starts_with($path, $prefix)
+    ? substr($path, strlen($prefix))
+    : $path;
+$clip = static fn (string $text): string => mb_substr($text, 0, 2000);
+
+$summary = [
+    'counts' => [
+        'tests' => 0,
+        'failures' => 0,
+        'errors' => 0,
+        'skipped' => 0,
+    ],
+    'failures' => [],
+    'annotations' => [],
+];
+
+$fail = static function (string $path, int $line, string $name, string $message) use (&$summary, $clip): void {
+    $summary['failures'][] = [
+        'file' => $path,
+        'line' => $line,
+        'name' => $name,
+        'message' => $clip($message),
+    ];
+    $summary['annotations'][] = [
+        'path' => $path,
+        'start_line' => max(1, $line),
+        'end_line' => max(1, $line),
+        'message' => $clip($name."\n".$message),
+    ];
+};
+
+if ($kind === 'junit') {
+    $xml = simplexml_load_file($file, null, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING);
+
+    if ($xml === false) {
+        exit(1);
+    }
+
+    foreach ($xml->xpath('//testcase') ?: [] as $case) {
+        $summary['counts']['tests']++;
+        $name = trim($case['class'].'::'.$case['name'], ':');
+        $path = $relative((string) $case['file']);
+        $line = (int) $case['line'];
+
+        if (isset($case->failure)) {
+            $summary['counts']['failures']++;
+            $fail($path, $line, $name, trim((string) $case->failure));
+        } elseif (isset($case->error)) {
+            $summary['counts']['errors']++;
+            $fail($path, $line, $name, trim((string) $case->error));
+        } elseif (isset($case->skipped)) {
+            $summary['counts']['skipped']++;
+        }
+    }
+}
+
+if ($kind === 'pint') {
+    $report = json_decode((string) file_get_contents($file), true, 64, JSON_THROW_ON_ERROR);
+
+    foreach ($report['files'] ?? [] as $entry) {
+        $fixers = implode(', ', array_map('strval', (array) ($entry['fixers'] ?? [])));
+        $summary['counts']['failures']++;
+        $fail($relative((string) ($entry['path'] ?? '')), 1, 'Pint', "Pint would fix: {$fixers}");
+    }
+}
+
+echo json_encode($summary, JSON_INVALID_UTF8_SUBSTITUTE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+PHP
+}
+
+# Copies a result file out of $out as uid 2000, so a symlink planted in its
+# place resolves with the sandbox's rights rather than root's.
+collect() {
+    local kind="$1"
+    local name="$2"
+    local copy="$state/result.$kind"
+
+    write_empty_summary
+    rm -f "$copy"
+
+    if ! kci-sandbox "$copy" "$out" -- head -c 67108864 "$name"; then
+        return 0
+    fi
+
+    if ! summarise "$kind" "$copy"; then
+        write_empty_summary
+    fi
+}
+
+# Fits the payload into 512 KB: the full caps first (200 failures, 2000
+# characters each, 500 annotations), then tighter ones, then counts only.
+build_payload() {
+    local tier
+    local max_failures
+    local max_message
+    local max_annotations
+    local tail_file="$state/tail.txt"
+
+    : >"$tail_file"
+    if [ -n "$last_log" ] && [ -f "$state/$last_log.log" ]; then
+        tail -c 2000 "$state/$last_log.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' >"$tail_file"
+    fi
+
+    for tier in '200 2000 500' '50 500 100' '0 0 0'; do
+        read -r max_failures max_message max_annotations <<<"$tier"
+
+        jq -n \
+            --arg id "$KCI_RUN_ID" \
+            --arg status "$status" \
+            --argjson duration "$SECONDS" \
+            --arg phase "$last_log" \
+            --rawfile tail "$tail_file" \
+            --slurpfile summary "$state/summary.json" \
+            --argjson max_failures "$max_failures" \
+            --argjson max_message "$max_message" \
+            --argjson max_annotations "$max_annotations" '
+            $summary[0] as $s
+            | (
+                if ($s.failures | length) == 0 and ($status == "failed" or $status == "errored") and ($tail | length) > 0
+                then [{file: "", line: 0, name: $phase, message: $tail}]
+                else $s.failures
+                end
+            ) as $failures
+            | {
+                ci_run_id: $id,
+                status: $status,
+                duration_s: $duration,
+                counts: $s.counts,
+                failures: ($failures[:$max_failures] | map(.message |= .[:$max_message])),
+                annotations: ($s.annotations[:$max_annotations] | map(.message |= .[:$max_message])),
+            }
+        ' >"$state/results.json"
+
+        if [ "$(wc -c <"$state/results.json")" -le 524288 ]; then
+            return 0
+        fi
+    done
+
+    say 'results do not fit in 512 KB'
+    return 1
+}
+
+report() {
+    reporting=true
+
+    if [ ! -f "$state/summary.json" ]; then
+        write_empty_summary
+    fi
+
+    # 1. Nothing from the pull request may be alive once a secret is in use.
+    if ! kci-sandbox --reap; then
+        say 'uid 2000 processes survived; results not sent'
+        exit 1
+    fi
+
+    # 2. Only now mint the results token.
+    build_payload
+    oidc_config kodizm-ci-results "$secret/results.curl"
+
+    if ! kci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
+        rm -f "$secret/results.curl"
+        say "results rejected (HTTP $(http_status "$state/results-response.json"))"
+        exit 1
+    fi
+
+    rm -f "$secret/results.curl"
+    say 'results sent'
+}
+
+on_error() {
+    trap - ERR
+
+    # errtrace hands this trap to command substitutions too; only the main
+    # shell reports, or one failure would post twice.
+    if [ "$BASHPID" != "$$" ]; then
+        exit 1
+    fi
+
+    say "internal error at line $1"
+
+    if [ "$reporting" = true ]; then
+        exit 1
+    fi
+
+    if [ -f "$secret/github.curl" ]; then
+        revoke_token
+    fi
+
+    status=errored
+    report
+    exit 1
+}
+
+trap 'on_error "$LINENO"' ERR
+
+# ---------------------------------------------------------------------------
+# prepare
+# ---------------------------------------------------------------------------
+
+exchange_token() {
+    local repository
+
+    oidc_config kodizm-ci-token "$secret/oidc-token.curl"
+    jq -n --arg id "$KCI_RUN_ID" '{ci_run_id: $id}' >"$state/token-request.json"
+
+    if ! kci-post "$api/api/ci/token" "$secret/oidc-token.curl" "$secret/token.json" "$state/token-request.json"; then
+        rm -f "$secret/oidc-token.curl"
+        say "token exchange failed (HTTP $(http_status "$secret/token.json"))"
+        return 1
+    fi
+    rm -f "$secret/oidc-token.curl"
+
+    # Every value below lands in a path, a URL or a curl config, so its shape
+    # is checked before use.
+    if ! jq -e '
+        (.token | type == "string" and test("^[A-Za-z0-9_]+$"))
+        and (.repository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
+        and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
+        and (.base_sha == null or (.base_sha | type == "string" and test("^([0-9a-f]{40})?$")))
+        and (.mode | IN("pr", "main"))
+        and (.role | IN("lint", "gateway", "warm", "test"))
+        and (.shards | type == "number" and . >= 1 and . == floor)
+        and (.shard | type == "number" and . >= 1 and . == floor)
+        and .shard <= .shards
+    ' "$secret/token.json" >/dev/null; then
+        say 'the token response has an unexpected shape'
+        return 1
+    fi
+
+    jq -j '.token' "$secret/token.json" >"$secret/github-token"
+    jq -r '
+        "header = \"Authorization: Bearer \(.token)\"",
+        "header = \"Accept: application/vnd.github+json\"",
+        "header = \"X-GitHub-Api-Version: 2022-11-28\""
+    ' "$secret/token.json" >"$secret/github.curl"
+
+    mode="$(jq -r '.mode' "$secret/token.json")"
+    role="$(jq -r '.role' "$secret/token.json")"
+    shard="$(jq -r '.shard' "$secret/token.json")"
+    shards="$(jq -r '.shards' "$secret/token.json")"
+    head_sha="$(jq -r '.head_sha' "$secret/token.json")"
+    base_sha="$(jq -r '.base_sha // ""' "$secret/token.json")"
+    repository="$(jq -r '.repository' "$secret/token.json")"
+
+    # The server resolves the job from its check_run_id; a role or shard that
+    # disagrees with this job's name means the two sides are out of step.
+    if [ "$role" != "${KCI_JOB_NAME%% (*}" ]; then
+        say 'the token response names another role than this job'
+        return 1
+    fi
+    if [[ "$KCI_JOB_NAME" =~ \(([0-9]+)\)$ ]] && [ "${BASH_REMATCH[1]}" != "$shard" ]; then
+        say 'the token response names another shard than this job'
+        return 1
+    fi
+
+    # The URL is written by printf, a builtin, so the repository name never
+    # becomes an argument of a git command.
+    git init --quiet "$tree"
+    printf '[remote "origin"]\n\turl = https://github.com/%s.git\n' "$repository" >>"$tree/.git/config"
+}
+
+# git asks GIT_ASKPASS for the password; the helper reads the token from the
+# 0600 file named in its environment, and credential.helper is emptied so no
+# helper stores it.
+git_with_token() {
+    GIT_ASKPASS="$secret/askpass" \
+        KCI_GIT_TOKEN_FILE="$secret/github-token" \
+        GIT_TERMINAL_PROMPT=0 \
+        git -C "$tree" -c credential.helper= "$@"
+}
+
+fetch_source() {
+    cat >"$secret/askpass" <<'SH'
+#!/bin/sh
+case "$1" in
+    Username*) echo x-access-token ;;
+    *) cat "$KCI_GIT_TOKEN_FILE" ;;
+esac
+SH
+    chmod 0700 "$secret/askpass"
+
+    if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$head_sha"; then
+        say 'fetching the head commit failed'
+        return 1
+    fi
+    git -C "$tree" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
+
+    # ci-scope.sh diffs two trees, so it needs the base too; without one it
+    # runs everything, the same as ci.yml.
+    if [[ "$base_sha" =~ ^[0-9a-f]{40}$ ]] && [[ ! "$base_sha" =~ ^0+$ ]] && [ "$base_sha" != "$head_sha" ]; then
+        if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$base_sha"; then
+            base_sha=''
+        fi
+    fi
+}
+
+scope_value() {
+    awk -v key="$1=" 'index($0, key) == 1 { value = substr($0, length(key) + 1) } END { print value }' \
+        "$state/scope.log"
+}
+
+decide_scope() {
+    if ! sandboxed scope "$tree" -- bash .github/scripts/ci-scope.sh "$base_sha" "$head_sha" "$mode"; then
+        say 'ci-scope.sh failed'
+        return 1
+    fi
+
+    gateway="$(scope_value gateway)"
+    php="$(scope_value php)"
+    filter="$(scope_value filter)"
+    pint_base="$(scope_value pint_base)"
+
+    # ci-scope.sh is code from the head commit, so its answer is untrusted.
+    if ! [[ "$gateway" =~ ^(true|false)$ ]] \
+        || ! [[ "$php" =~ ^(none|docs|affected|full)$ ]] \
+        || ! [[ "$filter" =~ ^[A-Za-z0-9_|]*$ ]] \
+        || ! [[ "$pint_base" =~ ^([0-9a-f]{40})?$ ]]; then
+        say 'ci-scope.sh gave an unusable answer'
+        return 1
+    fi
+
+    : >"$state/pint-files"
+
+    if [ "$role" != lint ] || [ -z "$pint_base" ]; then
+        return 0
+    fi
+
+    # Same list as ci.yml's Pint step: PHP files added, copied, modified or
+    # renamed since pint_base, minus the directories pint.json excludes.
+    if ! sandboxed pint-diff "$tree" -- \
+        git -c core.quotePath=false diff --name-only --diff-filter=ACMR "$pint_base" HEAD -- '*.php'; then
+        say 'listing the files for Pint failed'
+        return 1
+    fi
+
+    awk '/\.php$/ && !/^-/ && !/^(bootstrap\/cache|node_modules|packages|public|references|storage|vendor)\//' \
+        "$state/pint-diff.log" >"$state/pint-files"
+}
+
+# Lock file contents only: run.yml restores the cache under this key, and the
+# key reveals nothing a guess could not.
+cache_key() {
+    local file
+
+    for file in composer.lock package-lock.json; do
+        if [ -f "$tree/$file" ] && [ ! -L "$tree/$file" ]; then
+            cat "$tree/$file"
+        fi
+    done | sha256sum | cut -d' ' -f1
+}
+
+prepare() {
+    say 'prepare'
+
+    # 1. Nothing may be running as uid 2000 while the tokens exist.
+    kci-sandbox --reap
+
+    # 2. Facts and token, then the source, then the token is gone.
+    exchange_token
+    fetch_source
+    revoke_token
+    say "mode=$mode"
+
+    # 3. The repository's own scope rules run as uid 2000, after revocation.
+    #    -h: a symlink in the checkout is re-owned itself, never its target.
+    local key
+    key="$(cache_key)"
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$tree"
+    decide_scope
+    rm -rf "$tree/.git"
+
+    jq -n \
+        --arg mode "$mode" \
+        --arg role "$role" \
+        --argjson shard "$shard" \
+        --argjson shards "$shards" \
+        --arg gateway "$gateway" \
+        --arg php "$php" \
+        --arg filter "$filter" \
+        --arg pint_base "$pint_base" \
+        '{mode: $mode, role: $role, shard: $shard, shards: $shards, gateway: $gateway, php: $php, filter: $filter, pint_base: $pint_base}' \
+        >"$state/job.json"
+
+    printf 'cache_key=%s\nmode=%s\n' "$key" "$mode" >>"${GITHUB_OUTPUT:?}"
+    say "cache-key=$key"
+    say 'prepared'
+}
+
+# ---------------------------------------------------------------------------
+# run
+# ---------------------------------------------------------------------------
+
+composer_install() {
+    sandboxed install "$tree" BROADCAST_CONNECTION=log -- \
+        composer install --no-interaction --no-progress --prefer-dist "$@"
+}
+
+run_lint() {
+    local files=()
+    local args=(
+        --test
+        --format=json
+    )
+
+    if [ "$php" != affected ] && [ "$php" != full ]; then
+        status=skipped
+        return 0
+    fi
+
+    if [ -n "$pint_base" ]; then
+        mapfile -t files <"$state/pint-files"
+        if [ "${#files[@]}" -eq 0 ]; then
+            status=passed
+            return 0
+        fi
+        args+=(-- "${files[@]}")
+    else
+        args+=(--parallel)
+    fi
+
+    say 'install'
+    if ! composer_install --no-scripts; then
+        status=errored
+        return 0
+    fi
+
+    say 'lint'
+    # Pint's JSON goes to its own file; its stderr stays in the log. $out is a
+    # fixed path, so expanding it into the script is safe.
+    if sandboxed lint "$tree" -- \
+        sh -c "exec \"\$@\" >'$out/pint.json'" kci-stdout vendor/bin/pint "${args[@]}"; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect pint pint.json
+}
+
+run_gateway() {
+    if [ "$gateway" != true ]; then
+        status=skipped
+        return 0
+    fi
+
+    say 'gateway'
+    if sandboxed gateway "$tree/packages/kodizm-gateway" -- sh -c 'go vet ./... && go test -race ./...'; then
+        status=passed
+    else
+        status=failed
+    fi
+}
+
+run_warm() {
+    if [ "$mode" != main ]; then
+        status=skipped
+        return 0
+    fi
+
+    say 'warm'
+    if composer_install --no-scripts --no-plugins; then
+        status=passed
+    else
+        status=failed
+    fi
+}
+
+run_test() {
+    local args=(
+        artisan
+        test
+    )
+
+    case "$php" in
+        none)
+            status=skipped
+            return 0
+            ;;
+        docs)
+            # ci.yml runs only the rule-file check here, once.
+            if [ "$shard" -ne 1 ]; then
+                status=skipped
+                return 0
+            fi
+            args+=(--compact --filter RuleFileClassReferencesTest)
+            ;;
+        affected | full)
+            args=(artisan test --parallel --processes=4 --compact)
+            if [ "$shards" -gt 1 ]; then
+                args+=("--shard=$shard/$shards" --shard-test-distribution=sequential)
+            fi
+            if [ "$php" = affected ]; then
+                args+=(--filter "$filter")
+            fi
+            ;;
+    esac
+    args+=(--log-junit "$out/junit.xml")
+
+    say 'install'
+    if ! composer_install --optimize-autoloader; then
+        status=errored
+        return 0
+    fi
+
+    if [ "$php" != docs ]; then
+        if ! sandboxed assets "$tree" -- npm ci || ! sandboxed assets "$tree" -- npm run build; then
+            status=errored
+            return 0
+        fi
+    fi
+
+    if ! sandboxed setup "$tree" -- cp .env.example .env \
+        || ! sandboxed setup "$tree" -- php artisan key:generate --no-interaction \
+        || ! sandboxed setup "$tree" -- php artisan passport:keys --force --no-interaction; then
+        status=errored
+        return 0
+    fi
+
+    say 'test'
+    if sandboxed test "$tree" -- php "${args[@]}"; then
+        status=passed
+    else
+        status=failed
+    fi
+
+    collect junit junit.xml
+}
+
+run() {
+    say 'run'
+
+    if [ ! -f "$state/job.json" ]; then
+        say 'prepare has not run in this container'
+        return 1
+    fi
+
+    mode="$(jq -r '.mode' "$state/job.json")"
+    role="$(jq -r '.role' "$state/job.json")"
+    shard="$(jq -r '.shard' "$state/job.json")"
+    shards="$(jq -r '.shards' "$state/job.json")"
+    gateway="$(jq -r '.gateway' "$state/job.json")"
+    php="$(jq -r '.php' "$state/job.json")"
+    filter="$(jq -r '.filter' "$state/job.json")"
+    pint_base="$(jq -r '.pint_base' "$state/job.json")"
+
+    # 1. The cache was restored by root; -h keeps a planted symlink from
+    #    handing uid 2000 the file it points at.
+    kci-sandbox --reap
+    install -d -m 0700 -o "$sandbox_uid" -g "$sandbox_uid" "$out"
+    install -d -m 0700 "$cache/composer" "$cache/npm"
+    chown -R -h "$sandbox_uid:$sandbox_uid" "$cache"
+
+    sandbox_env=(
+        APP_ENV=testing
+        COMPOSER_CACHE_DIR="$cache/composer"
+        npm_config_cache="$cache/npm"
+    )
+
+    # 2. The role command, whose outcome becomes the status.
+    write_empty_summary
+    case "$role" in
+        lint) run_lint ;;
+        gateway) run_gateway ;;
+        warm) run_warm ;;
+        test) run_test ;;
+    esac
+
+    # 3. Kill, then report.
+    say 'report'
+    report
+}
+
+"$phase"

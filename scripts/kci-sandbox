@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# Runs one command as the unprivileged CI account, then kills every process
+# that account still owns. Everything a pull request ships (dependency
+# installs, tests, linters, repository scripts) goes through here.
+#
+# usage: kci-sandbox [--keep] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]
+#        kci-sandbox --reap
+#
+# The child runs with:
+#   - uid and gid 2000, no supplementary groups, no capabilities (inheritable,
+#     ambient and bounding sets emptied), no_new_privs so no setuid binary can
+#     give any back (setpriv);
+#   - an environment of PATH, LANG, CI, a fresh HOME and the given NAME=VALUE
+#     pairs only (env -i), so the runner's ACTIONS_* tokens and the
+#     GITHUB_ENV, GITHUB_OUTPUT, GITHUB_PATH and GITHUB_STEP_SUMMARY paths
+#     are absent;
+#   - stdin from /dev/null, stdout and stderr appended to <log-file> (created
+#     0600 by root) and no other file descriptor, so a workflow command it
+#     prints never reaches the runner, which parses only the step's own stdout
+#     and stderr;
+#   - at most 4096 processes, so the kill loop below always catches up.
+# Before the child starts, the runner's temp directory (it holds the file
+# command files and the step scripts), /github/home and /github/workflow are
+# made 0700. They belong to the runner's host account, which keeps its
+# access; root in the container bypasses the mode.
+#
+# After the child exits, every live uid 2000 process is SIGKILLed until none
+# is left. Zombies are not counted: PID 1 in a job container is
+# `tail -f /dev/null`, which never reaps orphans, and a zombie runs no code.
+# --keep skips that kill; only the isolation probe uses it, to prove the
+# survivor check fails when a process is left behind.
+#
+# Exits with the child's status, or 125 when uid 2000 processes survive the
+# kill loop. --reap runs the kill loop alone (0, or 125 on survivors).
+set -euo pipefail
+
+sandbox_uid=2000
+nproc_limit=4096
+
+usage() {
+    echo 'usage: kci-sandbox [--keep] <log-file> <workdir> [NAME=VALUE ...] -- <command> [arg ...]' >&2
+    echo '       kci-sandbox --reap' >&2
+    exit 2
+}
+
+live_sandbox_processes() {
+    ps -A -o uid=,stat= | awk -v uid="$sandbox_uid" '$1 == uid && $2 !~ /^Z/ { n++ } END { print n + 0 }'
+}
+
+# SIGKILL is not instant and a forking process can add children between two
+# scans, so the loop repeats until a scan comes back empty, for up to 10 s.
+reap() {
+    local attempt
+    local status
+
+    for attempt in $(seq 1 100); do
+        status=0
+        pkill -9 -u "$sandbox_uid" || status=$?
+
+        # pkill: 0 signalled something, 1 matched nothing, 2 or 3 is a failure.
+        if [ "$status" -gt 1 ]; then
+            echo "kci-sandbox: pkill failed with status $status" >&2
+            return 125
+        fi
+
+        if [ "$(live_sandbox_processes)" -eq 0 ]; then
+            return 0
+        fi
+
+        if [ "$attempt" -lt 100 ]; then
+            sleep 0.1
+        fi
+    done
+
+    echo 'kci-sandbox: uid 2000 processes survived the kill loop' >&2
+    return 125
+}
+
+lock_runner_dirs() {
+    local dir
+    local dirs=(
+        "${RUNNER_TEMP:-}"
+        /github/home
+        /github/workflow
+    )
+
+    for dir in "${GITHUB_ENV:-}" "${GITHUB_OUTPUT:-}" "${GITHUB_PATH:-}" "${GITHUB_STEP_SUMMARY:-}"; do
+        if [ -n "$dir" ]; then
+            dirs+=("$(dirname "$dir")")
+        fi
+    done
+
+    for dir in "${dirs[@]}"; do
+        if [ -n "$dir" ] && [ -d "$dir" ]; then
+            chmod 0700 "$dir"
+        fi
+    done
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo 'kci-sandbox: must run as root' >&2
+    exit 2
+fi
+
+if [ "${1:-}" = --reap ]; then
+    [ $# -eq 1 ] || usage
+    reap
+    exit $?
+fi
+
+keep=false
+if [ "${1:-}" = --keep ]; then
+    keep=true
+    shift
+fi
+
+[ $# -ge 4 ] || usage
+
+log="$1"
+workdir="$2"
+shift 2
+
+child_env=(
+    "PATH=$PATH"
+    LANG=C.UTF-8
+    CI=true
+)
+
+while [ $# -gt 0 ] && [ "$1" != -- ]; do
+    if ! [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+        usage
+    fi
+    child_env+=("$1")
+    shift
+done
+
+[ "${1:-}" = -- ] || usage
+shift
+[ $# -ge 1 ] || usage
+
+lock_runner_dirs
+
+# 1. A fresh HOME per command: nothing one phase leaves in it (an .npmrc, a
+#    shell rc file, a planted binary) reaches the next.
+home="$(mktemp -d /tmp/kci-home.XXXXXXXX)"
+chown "$sandbox_uid:$sandbox_uid" "$home"
+chmod 0700 "$home"
+child_env+=("HOME=$home")
+
+# 2. Run the child. The subshell stays root until setpriv, so it can open the
+#    root-owned log and close every inherited descriptor above 2 first.
+status=0
+(
+    umask 077
+    exec </dev/null >>"$log" 2>&1
+
+    for fd_path in /proc/self/fd/*; do
+        fd="${fd_path##*/}"
+        if [ "$fd" -gt 2 ] && [ -e "$fd_path" ]; then
+            exec {fd}>&-
+        fi
+    done
+
+    ulimit -u "$nproc_limit"
+    cd "$workdir"
+
+    exec setpriv \
+        --reuid="$sandbox_uid" \
+        --regid="$sandbox_uid" \
+        --clear-groups \
+        --no-new-privs \
+        --inh-caps=-all \
+        --bounding-set=-all \
+        -- env -i "${child_env[@]}" "$@"
+) || status=$?
+
+# 3. Nothing the child started may outlive it: the caller uses secrets next.
+if [ "$keep" = false ]; then
+    reap || exit $?
+    rm -rf "$home"
+fi
+
+exit "$status"

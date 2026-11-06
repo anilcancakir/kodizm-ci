@@ -1,0 +1,139 @@
+name: Isolation probe
+
+# Proves on a real hosted runner what kci-sandbox promises: code running as
+# uid 2000 cannot read a secret root holds, cannot write the runner's file
+# commands or step summary, cannot reach the runner's workflow command parser,
+# and leaves no process behind. The public log shows only the secret's sha256
+# and one line per check; the probe's own output stays in a root-only file.
+on:
+  workflow_dispatch:
+    inputs:
+      expect_fail:
+        description: Keep the probe's daemon alive, so the survivor check has to fail the job
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: read
+  # Puts ACTIONS_ID_TOKEN_REQUEST_URL and _TOKEN in the step environment, the
+  # same as run.yml, so the probe can try to reach them from uid 2000.
+  id-token: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    container:
+      image: ghcr.io/kodizm/kodizm-ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Probe the sandbox
+        env:
+          KCI_PROBE_EXPECT_FAIL: ${{ inputs.expect_fail }}
+        run: |
+          umask 077
+
+          # 1. A secret only root may see: exported, so every root process this
+          #    step starts (kci-sandbox among them) carries it in its environ,
+          #    and in a 0600 file inside the runner's temp directory.
+          KCI_PROBE_SECRET="kciprobe-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          export KCI_PROBE_SECRET
+          printf 'secret-sha256=%s\n' "$(printf '%s' "$KCI_PROBE_SECRET" | sha256sum | cut -d' ' -f1)"
+
+          secret_dir="$RUNNER_TEMP/kciprobe"
+          mkdir -m 0700 "$secret_dir"
+          printf '%s\n' "$KCI_PROBE_SECRET" >"$secret_dir/secret"
+
+          install -d -m 0711 /kciprobe
+          install -d -m 0700 /kciprobe/log
+          install -d -m 0700 -o 2000 -g 2000 /kciprobe/out
+          report=/kciprobe/out/report
+
+          # 2. The probe as uid 2000. Its exit status is printed, not trusted:
+          #    the verdict comes from the report and from root's own checks.
+          keep=()
+          if [ "$KCI_PROBE_EXPECT_FAIL" = true ]; then
+            keep=(--keep)
+          fi
+
+          probe_status=0
+          kci-sandbox "${keep[@]}" /kciprobe/log/probe.log /kciprobe/out \
+            KCI_PROBE_FILE="$secret_dir/secret" \
+            KCI_PROBE_TEMP="$RUNNER_TEMP" \
+            KCI_PROBE_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            KCI_PROBE_ENV="$GITHUB_ENV" \
+            KCI_PROBE_OUTPUT="$GITHUB_OUTPUT" \
+            KCI_PROBE_PATH="$GITHUB_PATH" \
+            -- kci-probe "$report" || probe_status=$?
+          echo "probe: kci-sandbox exited $probe_status"
+
+          failed=false
+          if [ "$probe_status" -ne 0 ]; then
+            failed=true
+          fi
+
+          # 3. Every check must be present and blocked; a missing line fails too.
+          checks=(
+            environ_secret
+            environ_oidc
+            environ_foreign
+            cmdline_secret
+            foreign_fd_write
+            file_read
+            temp_read
+            summary_write
+            file_commands_write
+            open_fd
+            tty_write
+            privileges
+          )
+          for check in "${checks[@]}"; do
+            if grep -qx "$check=blocked" "$report"; then
+              echo "probe: $check blocked"
+            else
+              echo "probe: $check NOT blocked"
+              failed=true
+            fi
+          done
+
+          if grep -qx 'info_cmdline_readable=yes' "$report"; then
+            echo 'probe: info: argv of other accounts is readable (no hidepid)'
+          fi
+
+          if ! grep -qx 'daemon=started' "$report"; then
+            echo 'probe: daemon was not started, so the survivor check proves nothing'
+            failed=true
+          fi
+
+          # 4. Root's own view: no marker in any file command file or the
+          #    summary, nothing planted beside them.
+          for command_file in "$GITHUB_STEP_SUMMARY" "$GITHUB_ENV" "$GITHUB_OUTPUT" "$GITHUB_PATH"; do
+            if grep -qs KCIPROBE "$command_file"; then
+              echo 'probe: a file command file holds a probe marker'
+              failed=true
+            fi
+          done
+          if [ -e "$(dirname "$GITHUB_ENV")/kciprobe-planted" ]; then
+            echo 'probe: a file was planted beside the file command files'
+            failed=true
+          fi
+
+          # 5. No live uid 2000 process may survive (zombies run no code, and
+          #    PID 1 here never reaps them).
+          live="$(ps -A -o uid=,stat= | awk '$1 == 2000 && $2 !~ /^Z/ { n++ } END { print n + 0 }')"
+          echo "probe: live uid 2000 processes after the sandbox: $live"
+          if [ "$live" -ne 0 ]; then
+            failed=true
+          fi
+
+          if [ "$failed" = true ]; then
+            echo 'probe: FAILED'
+            exit 1
+          fi
+          echo 'probe: passed'

@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Isolation probe: runs inside kci-sandbox as uid 2000 and tries every way out
+# the sandbox is meant to close. Each attempt is recorded in <report-file> as
+# `<check>=blocked` or `<check>=LEAKED`; the root step of probe.yml fails the
+# job on any LEAKED line or a missing check. A value the probe manages to read
+# is never printed or recorded, only the fact that the read worked.
+#
+# usage: kci-probe <report-file>
+#
+# Environment (paths only, set by probe.yml through kci-sandbox):
+#   KCI_PROBE_FILE     root-only file holding the probe secret
+#   KCI_PROBE_TEMP     the runner's temp directory
+#   KCI_PROBE_SUMMARY  the step's GITHUB_STEP_SUMMARY file
+#   KCI_PROBE_ENV, KCI_PROBE_OUTPUT, KCI_PROBE_PATH  the step's file command files
+#
+# The secret has the shape kciprobe-<32 hex>; the probe searches for that
+# shape because it is never told the value.
+set -euo pipefail
+
+report="${1:?usage: kci-probe <report-file>}"
+secret_pattern='kciprobe-[0-9a-f]{32}'
+self_uid="$(id -u)"
+
+record() {
+    printf '%s=%s\n' "$1" "$2" >>"$report"
+}
+
+verdict() {
+    if [ "$2" = true ]; then
+        record "$1" LEAKED
+    else
+        record "$1" blocked
+    fi
+}
+
+: >"$report"
+
+# 1. Process environments: the secret, the OIDC request token, and any other
+#    account's environ at all (the kernel gates it behind ptrace access).
+environ_secret=false
+environ_oidc=false
+environ_foreign=false
+cmdline_secret=false
+foreign_fd_write=false
+cmdline_readable=no
+
+for proc in /proc/[0-9]*; do
+    pid="${proc##*/}"
+    owner="$(stat -c %u "$proc" 2>/dev/null)" || continue
+
+    if grep -qaE "$secret_pattern" "$proc/environ" 2>/dev/null; then
+        environ_secret=true
+    fi
+    if grep -qa 'ACTIONS_ID_TOKEN_REQUEST_TOKEN=' "$proc/environ" 2>/dev/null; then
+        environ_oidc=true
+    fi
+    if grep -qaE "$secret_pattern" "$proc/cmdline" 2>/dev/null; then
+        cmdline_secret=true
+    fi
+
+    if [ "$owner" != "$self_uid" ] && [ "$pid" != "$$" ]; then
+        if head -c 1 "$proc/environ" >/dev/null 2>&1; then
+            environ_foreign=true
+        fi
+        if head -c 1 "$proc/cmdline" >/dev/null 2>&1; then
+            cmdline_readable=yes
+        fi
+        # A root process's stdout may be the step's pipe to the runner.
+        if { printf '::error::KCIPROBE-MARKER via /proc/%s/fd/1\n' "$pid" >>"$proc/fd/1"; } 2>/dev/null; then
+            foreign_fd_write=true
+        fi
+    fi
+done
+
+verdict environ_secret "$environ_secret"
+verdict environ_oidc "$environ_oidc"
+verdict environ_foreign "$environ_foreign"
+verdict cmdline_secret "$cmdline_secret"
+verdict foreign_fd_write "$foreign_fd_write"
+# Informational: whether argv of other accounts is readable (no hidepid).
+record info_cmdline_readable "$cmdline_readable"
+
+# 2. The root-only secret file and the runner's temp directory.
+file_read=false
+if [ -n "${KCI_PROBE_FILE:-}" ] && head -c 1 "$KCI_PROBE_FILE" >/dev/null 2>&1; then
+    file_read=true
+fi
+verdict file_read "$file_read"
+
+temp_read=false
+if [ -n "${KCI_PROBE_TEMP:-}" ] && ls "$KCI_PROBE_TEMP" >/dev/null 2>&1; then
+    temp_read=true
+fi
+verdict temp_read "$temp_read"
+
+# 3. The step summary and the file command files, by path and by directory.
+summary_write=false
+if [ -n "${KCI_PROBE_SUMMARY:-}" ] \
+    && { printf '::error::KCIPROBE-MARKER in the step summary\n' >>"$KCI_PROBE_SUMMARY"; } 2>/dev/null; then
+    summary_write=true
+fi
+verdict summary_write "$summary_write"
+
+file_commands_write=false
+for command_file in "${KCI_PROBE_ENV:-}" "${KCI_PROBE_OUTPUT:-}" "${KCI_PROBE_PATH:-}"; do
+    if [ -z "$command_file" ]; then
+        continue
+    fi
+    if { printf 'KCIPROBE_MARKER=1\n' >>"$command_file"; } 2>/dev/null; then
+        file_commands_write=true
+    fi
+    if { : >"$(dirname "$command_file")/kciprobe-planted"; } 2>/dev/null; then
+        file_commands_write=true
+    fi
+done
+verdict file_commands_write "$file_commands_write"
+
+# 4. Inherited descriptors and the terminal: anything open besides 0, 1 and 2
+#    could lead back to the runner's parser. 255 is bash's own handle on this
+#    script. The descriptor the glob itself opened is closed again by the time
+#    the loop runs, and `[ -e ]` opens none, so it cannot report its own.
+open_fd=false
+for fd_path in /proc/"$$"/fd/*; do
+    case "${fd_path##*/}" in
+        0 | 1 | 2 | 255)
+            continue
+            ;;
+    esac
+    if [ -e "$fd_path" ]; then
+        open_fd=true
+    fi
+done
+verdict open_fd "$open_fd"
+
+tty_write=false
+if { printf '::error::KCIPROBE-MARKER via /dev/tty\n' >/dev/tty; } 2>/dev/null; then
+    tty_write=true
+fi
+verdict tty_write "$tty_write"
+
+# 5. Privileges: the uid, no groups, no capabilities, no_new_privs set.
+privileges=false
+if [ "$self_uid" -ne 2000 ] || [ "$(id -g)" -ne 2000 ] || [ "$(id -G)" != 2000 ]; then
+    privileges=true
+fi
+if ! awk '$1 == "NoNewPrivs:" && $2 == 1 { found = 1 } END { exit !found }' /proc/self/status; then
+    privileges=true
+fi
+if awk '$1 ~ /^Cap(Inh|Prm|Eff|Bnd|Amb):$/ && $2 !~ /^0+$/ { found = 1 } END { exit !found }' /proc/self/status; then
+    privileges=true
+fi
+verdict privileges "$privileges"
+
+# 6. Workflow commands on the probe's own stdout and stderr. These go to the
+#    sandbox log; probe.yml's public log and annotations must not show them.
+printf '::error::KCIPROBE-MARKER on stdout\n'
+printf '::error::KCIPROBE-MARKER on stderr\n' >&2
+printf '::add-mask::KCIPROBE-MASK\n'
+printf '::warning::KCIPROBE-MARKER on stdout\n'
+
+# 7. A daemon in its own session, detached from the probe. kci-sandbox has to
+#    kill it; probe.yml's expect_fail run keeps it to prove the check bites.
+setsid -f bash -c 'while :; do sleep 5; done' </dev/null >/dev/null 2>&1
+record daemon started

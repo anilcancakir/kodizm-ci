@@ -1,0 +1,89 @@
+name: Build and Push CI Image
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer PR push cancels the older build; a main run is never cancelled, so a promotion cannot be
+# cut off between the candidate push and the `:latest` retag.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  REPOSITORY: ghcr.io/kodizm/kodizm-ci
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # Only a run on main publishes. Pull requests (forks included) and dispatches from other refs
+      # build without pushing and never log in to the registry.
+      PUBLISH: ${{ github.ref == 'refs/heads/main' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: ${{ env.PUBLISH == 'true' }}
+          provenance: false
+          tags: ${{ env.REPOSITORY }}:cand-${{ github.sha }}
+          cache-from: type=registry,ref=${{ env.REPOSITORY }}:buildcache
+          cache-to: ${{ env.PUBLISH == 'true' && format('type=registry,ref={0}:buildcache,mode=max', env.REPOSITORY) || '' }}
+
+  promote:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A registry-side retag of the built manifest: nothing is rebuilt or re-pushed layer by layer.
+      # The digest line is what the consuming workflow pins, so a malformed value fails the run here.
+      - name: Promote candidate
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create \
+            --tag "${REPOSITORY}:latest" \
+            "${REPOSITORY}:cand-${GITHUB_SHA}"
+          digest="$(docker buildx imagetools inspect "${REPOSITORY}:latest" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "unexpected digest: ${digest}" >&2; exit 1; }
+          echo "promoted-digest: ${digest}"
