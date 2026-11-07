@@ -3,6 +3,7 @@
 # retries while the server or GitHub is briefly unable to answer it.
 #
 # usage: ci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]
+#        ci-post -z <url> <config-file> <response-file> <body-file>
 #
 # <config-file>   curl config lines such as `header = "Authorization: Bearer ..."`,
 #                 mode 0600. A bearer on the command line would sit in
@@ -11,6 +12,10 @@
 #                 receives its HTTP status code (000 when nothing came back).
 # <body-file>     sent as JSON; the method defaults to POST with a body and to
 #                 GET without one.
+# -z              POSTs <body-file> as application/gzip with X-Ci-Run and
+#                 X-Ci-Job taken from CI_RUN_ID and CI_JOB_NAME, and allows
+#                 120 s per attempt instead of 60, for a log upload of up to
+#                 8 MiB.
 #
 # Retries: 401 up to 3 times (a run id the server stored a moment ago may not
 # be visible yet), 429 and 503 after their Retry-After seconds within 300 s in
@@ -20,14 +25,24 @@ set -euo pipefail
 
 usage() {
     echo 'usage: ci-post [-X <method>] <url> <config-file> <response-file> [<body-file>]' >&2
+    echo '       ci-post -z <url> <config-file> <response-file> <body-file>' >&2
     exit 2
 }
 
 method=''
-if [ "${1:-}" = -X ]; then
-    method="${2:-}"
-    shift 2 || usage
-fi
+gzip=false
+max_time=60
+case "${1:-}" in
+    -X)
+        method="${2:-}"
+        shift 2 || usage
+        ;;
+    -z)
+        gzip=true
+        max_time=120
+        shift
+        ;;
+esac
 
 if [ $# -lt 3 ] || [ $# -gt 4 ]; then
     usage
@@ -39,18 +54,30 @@ response="$3"
 body="${4:-}"
 headers="$response.headers"
 
+if [ "$gzip" = true ] && { [ -z "$body" ] || [ -z "${CI_RUN_ID:-}" ] || [ -z "${CI_JOB_NAME:-}" ]; }; then
+    usage
+fi
+
 curl_args=(
     --config "$config"
     --silent
     --show-error
     --user-agent 'ci-job/1'
-    --max-time 60
+    --max-time "$max_time"
     --dump-header "$headers"
     --output "$response"
     --write-out '%{http_code}'
 )
 
-if [ -n "$body" ]; then
+if [ "$gzip" = true ]; then
+    method=POST
+    curl_args+=(
+        --header 'Content-Type: application/gzip'
+        --header "X-Ci-Run: $CI_RUN_ID"
+        --header "X-Ci-Job: $CI_JOB_NAME"
+        --data-binary "@$body"
+    )
+elif [ -n "$body" ]; then
     method="${method:-POST}"
     curl_args+=(
         --header 'Content-Type: application/json'

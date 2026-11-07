@@ -2,7 +2,7 @@
 
 // Test double for ci-post, served by `php -S`. It records every request and
 // answers /sequence with 401, 429, 503 and then 200, so a single ci-post run
-// walks each retry branch; /reject always answers 422.
+// walks each retry branch; /reject always answers 422 and /created 201.
 
 $state = getenv('CI_TEST_STATE');
 $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
@@ -21,12 +21,22 @@ $record('authorization', $_SERVER['HTTP_AUTHORIZATION'] ?? '');
 $record('method', $_SERVER['REQUEST_METHOD']);
 $record('content-type', $_SERVER['CONTENT_TYPE'] ?? '');
 $record('user-agent', $_SERVER['HTTP_USER_AGENT'] ?? '');
+$record('ci-run', $_SERVER['HTTP_X_CI_RUN'] ?? '');
+$record('ci-job', $_SERVER['HTTP_X_CI_JOB'] ?? '');
 $record('body', file_get_contents('php://input'));
+file_put_contents("{$state}/last-body", file_get_contents('php://input'));
 
 // Keeps each curl process alive long enough for the test to sample its argv.
 usleep(300000);
 
 header('Content-Type: application/json');
+
+if ($path === '/created') {
+    http_response_code(201);
+    echo '{"stored":true}';
+
+    return true;
+}
 
 if ($path === '/reject') {
     http_response_code(422);

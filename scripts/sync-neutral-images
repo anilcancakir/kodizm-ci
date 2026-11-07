@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Publishes the job image sources to the neutral images repository, whose
+# build.yml builds ghcr.io/<repo> and ghcr.io/<repo>-flutter, and prints the
+# digests the build promoted.
+#
+# usage: sync-neutral-images [--dry-run]
+#
+# Copies the image sources (both Dockerfiles, scripts/ci-*, build.yml) into a
+# temporary directory and refuses, before any commit, when a path or a file
+# there carries an owner string. Then commits the copy once, as multi-progs
+# with its noreply address, on top of the target's main, pushes it with the
+# gh-pool credentials, waits for the build run of that commit and prints its
+# `promoted-digest:` lines. --dry-run stops before anything touches the
+# network: the commit is made on an empty history and nothing is pushed.
+#
+# Environment (all optional):
+#   CI_IMAGES_REPO    target repository, default multi-progs/ci-images
+#   CI_IMAGES_SOURCE  directory holding the sources, default this checkout
+#   GH_CONFIG_DIR     gh configuration of the neutral account,
+#                     default $HOME/.config/gh-pool
+#
+# The target publishes only when its repository variable CI_PUBLISH is
+# `true`; without it the build skips every job and no digest is printed,
+# which exits 1.
+set -euo pipefail
+
+usage() {
+    echo 'usage: sync-neutral-images [--dry-run]' >&2
+    exit 2
+}
+
+dry_run=false
+case "${1:-}" in
+    '') ;;
+    --dry-run) dry_run=true ;;
+    *) usage ;;
+esac
+
+repo="${CI_IMAGES_REPO:-multi-progs/ci-images}"
+source_root="${CI_IMAGES_SOURCE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+gh_config="${GH_CONFIG_DIR:-$HOME/.config/gh-pool}"
+author_name=multi-progs
+author_email=263353081+multi-progs@users.noreply.github.com
+owner_pattern='kodizm|kci|anilcan|cakir'
+sources=(
+    Dockerfile
+    Dockerfile.flutter
+    scripts/ci-job
+    scripts/ci-post
+    scripts/ci-probe
+    scripts/ci-sandbox
+    .github/workflows/build.yml
+)
+
+if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "sync: CI_IMAGES_REPO is not owner/name: $repo" >&2
+    exit 2
+fi
+
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+
+# 1. The copy, file modes kept so the image's scripts stay executable.
+for file in "${sources[@]}"; do
+    mkdir -p "$stage/$(dirname "$file")"
+    cp -p "$source_root/$file" "$stage/$file"
+done
+
+# 2. Nothing the neutral account publishes may name the owner: neither a
+#    path nor any byte of a file, binary or not.
+refused="$(
+    cd "$stage"
+    {
+        find . -type f | sed 's|^\./||' | grep -iE "$owner_pattern" || true
+        grep -rilE "$owner_pattern" . | sed 's|^\./||' || true
+    } | sort -u
+)"
+if [ -n "$refused" ]; then
+    echo 'sync: refused, an owner string appears in:' >&2
+    while IFS= read -r path; do
+        printf '  %s\n' "$path"
+    done <<<"$refused" >&2
+    exit 1
+fi
+
+# 3. One commit as the neutral identity. A real sync builds it on the target's
+#    main so the push is a fast-forward; a target without main gets a root
+#    commit.
+remote="https://github.com/$repo.git"
+export GH_CONFIG_DIR="$gh_config"
+unset GH_TOKEN GITHUB_TOKEN
+
+pool_git() {
+    git -C "$stage" -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"
+}
+
+git -C "$stage" init --quiet --initial-branch=main
+if [ "$dry_run" = false ]; then
+    # An assignment, so a failed lookup stops the sync rather than reading as
+    # a target without main.
+    heads="$(pool_git ls-remote --heads "$remote" main)"
+    if [ -n "$heads" ]; then
+        pool_git fetch --quiet --depth=1 "$remote" main
+        git -C "$stage" reset --quiet --soft FETCH_HEAD
+    fi
+fi
+git -C "$stage" add -A
+
+if git -C "$stage" rev-parse --verify --quiet HEAD >/dev/null && git -C "$stage" diff --cached --quiet; then
+    echo "sync: $repo main already carries these sources"
+    exit 0
+fi
+
+git -C "$stage" \
+    -c user.name="$author_name" \
+    -c user.email="$author_email" \
+    -c commit.gpgsign=false \
+    commit --quiet -m 'Sync CI images'
+commit="$(git -C "$stage" rev-parse HEAD)"
+
+echo "commit: $commit"
+echo "author: $(git -C "$stage" log -1 --format='%an <%ae>')"
+echo 'files:'
+git -C "$stage" ls-files | sed 's/^/  /'
+
+if [ "$dry_run" = true ]; then
+    echo 'dry run: stopping before push'
+    exit 0
+fi
+
+# 4. Push, then find the build run of that commit; GitHub lists it a few
+#    seconds after the push.
+pool_git push --quiet "$remote" HEAD:refs/heads/main
+
+run_id=''
+for _ in $(seq 1 60); do
+    run_id="$(gh run list --repo "$repo" --workflow build.yml --commit "$commit" \
+        --json databaseId --jq '.[0].databaseId // empty')"
+    if [ -n "$run_id" ]; then
+        break
+    fi
+    sleep 5
+done
+if [ -z "$run_id" ]; then
+    echo "sync: no build run appeared for $commit" >&2
+    exit 1
+fi
+
+echo "build: https://github.com/$repo/actions/runs/$run_id"
+gh run watch "$run_id" --repo "$repo" --exit-status >/dev/null
+
+# 5. The promote jobs print one digest line per image.
+digests="$(
+    gh run view "$run_id" --repo "$repo" --log \
+        | grep -oE 'promoted-digest: ghcr\.io/[^ ]+@sha256:[0-9a-f]{64}' \
+        | sort -u || true
+)"
+if [ -z "$digests" ]; then
+    echo 'sync: the build promoted no image; is CI_PUBLISH set on the target?' >&2
+    exit 1
+fi
+printf '%s\n' "$digests"

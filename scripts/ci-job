@@ -36,7 +36,10 @@
 # root-only logs under /ci/state, because an error message (git's, jq's) can
 # quote the private repository name or a token. No secret is ever an
 # argument: curl reads headers from 0600 config files, git reads the token
-# through GIT_ASKPASS.
+# through GIT_ASKPASS, or, when the token response turns features.git_proxy
+# on, takes the ticket and the token from http.extraHeader values in its
+# environment and fetches through the Worker's /git. features.log_upload
+# sends the redacted root-only logs to the server once the results are in.
 #
 # Exits 0 once the server accepted the results, whatever their status, so the
 # public run carries no verdict on private code; 1 when they were not
@@ -62,6 +65,8 @@ status=errored
 last_log=''
 reporting=false
 sandbox_env=()
+git_proxy=false
+log_upload=false
 
 say() {
     printf 'ci: %s\n' "$1" >&3
@@ -157,18 +162,25 @@ oidc_config() {
     rm -f "$secret/oidc-request.curl" "$secret/oidc.json" "$secret/oidc.json.status"
 }
 
+# Through the Worker the revocation goes to its /gh-token with the ticket
+# header github.curl then carries.
 revoke_token() {
     local revoked=true
+    local url=https://api.github.com/installation/token
 
     if [ ! -f "$secret/github.curl" ]; then
         return 0
     fi
 
-    if ! ci-post -X DELETE https://api.github.com/installation/token "$secret/github.curl" "$state/revoke.json"; then
+    if [ "$git_proxy" = true ]; then
+        url="$api/gh-token"
+    fi
+
+    if ! ci-post -X DELETE "$url" "$secret/github.curl" "$state/revoke.json"; then
         revoked=false
     fi
 
-    rm -f "$secret/github.curl" "$secret/github-token" "$secret/askpass" "$secret/token.json"
+    rm -f "$secret/github.curl" "$secret/github-token" "$secret/askpass" "$secret/token.json" "$secret/git-ticket"
 
     if [ "$revoked" = false ]; then
         say "installation token revocation failed (HTTP $(http_status "$state/revoke.json"))"
@@ -360,6 +372,54 @@ collect_report() {
     done
 }
 
+# Prints at most 2000 bytes of <log> without colour codes. A failing test's
+# name sits thousands of progress lines before the end of a long run, so when
+# the log has failure markers (a reporter's [E], FAIL or Expected: lines, else
+# error and exception lines) it prints each marker line and the three after
+# it, first markers first; otherwise its last 2000 bytes.
+failure_tail() {
+    local plain="$state/tail-source.txt"
+    local marked="$state/tail-marked.txt"
+
+    sed 's/\x1b\[[0-9;]*[A-Za-z]//g' "$1" >"$plain"
+
+    # The output goes to a file before it is cut: head closing a pipe early
+    # would fail awk with SIGPIPE under pipefail.
+    awk \
+        -v strong='\\[E\\]|FAIL|ERRORS!|EXCEPTION CAUGHT|Some tests failed|Expected:' \
+        -v weak='[Ee]rror|[Ee]xception|[Ff]ailed' '
+        NR == FNR {
+            if ($0 ~ strong) {
+                strongs[FNR] = 1
+            } else if ($0 ~ weak) {
+                weaks[FNR] = 1
+            }
+            next
+        }
+        FNR == 1 {
+            use_strong = length(strongs) > 0
+            until = 0
+            printed = 0
+        }
+        (use_strong && (FNR in strongs)) || (!use_strong && (FNR in weaks)) {
+            if (printed && FNR > printed + 1 && FNR > until) {
+                print "..."
+            }
+            until = FNR + 3
+        }
+        FNR <= until {
+            print
+            printed = FNR
+        }
+    ' "$plain" "$plain" >"$marked"
+
+    if [ -s "$marked" ]; then
+        head -c 2000 "$marked"
+    else
+        tail -c 2000 "$plain"
+    fi
+}
+
 # Fits the payload into 512 KB: the full caps first (200 failures, 2000
 # characters each, 500 annotations), then tighter ones, then counts only.
 build_payload() {
@@ -371,7 +431,7 @@ build_payload() {
 
     : >"$tail_file"
     if [ -n "$last_log" ] && [ -f "$state/$last_log.log" ]; then
-        tail -c 2000 "$state/$last_log.log" | sed 's/\x1b\[[0-9;]*[A-Za-z]//g' >"$tail_file"
+        failure_tail "$state/$last_log.log" >"$tail_file"
     fi
 
     for tier in '200 2000 500' '50 500 100' '0 0 0'; do
@@ -433,11 +493,83 @@ report() {
     if ! ci-post "$api/api/ci/results" "$secret/results.curl" "$state/results-response.json" "$state/results.json"; then
         rm -f "$secret/results.curl"
         say "results rejected (HTTP $(http_status "$state/results-response.json"))"
+        send_logs
         exit 1
     fi
 
     rm -f "$secret/results.curl"
     say 'results sent'
+    send_logs
+}
+
+# Uploads the logs when the token response turned log_upload on. A failed
+# upload is one public line: the results decide the job, never the logs.
+send_logs() {
+    if [ "$log_upload" != true ]; then
+        return 0
+    fi
+
+    if upload_logs; then
+        say 'logs sent'
+    else
+        say "logs not sent (HTTP $(http_status "$state/logs-response.json"))"
+    fi
+}
+
+# Every root-only log of this container, oldest first, each under an
+# `== <phase> ==` heading, with every value in $secret/redact (the token, its
+# Basic form, the ticket, the cache namespace) replaced line by line, then
+# gzipped. The Worker refuses a body over 8 MiB, so the tail is cut tighter
+# until it fits; the last cut is small enough for any content. Called only
+# as an `if` condition, where errexit is off, so every step checks itself.
+upload_logs() {
+    local text="$state/logs.txt"
+    local body="$state/logs.gz"
+    local log
+    local cap
+    local fits=false
+
+    rm -f "$state/logs-response.json.status"
+
+    # 1. One redacted text. The names are ci-job's own fixed log names.
+    if ! ls -1tr "$state"/*.log >"$state/logs.list"; then
+        return 1
+    fi
+    if ! while IFS= read -r log; do
+        printf '== %s ==\n' "$(basename "$log" .log)"
+        cat "$log"
+    done <"$state/logs.list" | php -r '
+        $secrets = array_values(array_filter(array_map("trim", file($argv[1]))));
+        while (($line = fgets(STDIN)) !== false) {
+            echo str_replace($secrets, "[redacted]", $line);
+        }
+    ' -- "$secret/redact" >"$text"; then
+        return 1
+    fi
+
+    # 2. The tail that fits in 8 MiB once gzipped.
+    for cap in 67108864 33554432 16777216 8323072; do
+        if ! tail -c "$cap" "$text" | gzip -c >"$body"; then
+            return 1
+        fi
+        if [ "$(wc -c <"$body")" -le 8388608 ]; then
+            fits=true
+            break
+        fi
+    done
+    if [ "$fits" != true ]; then
+        return 1
+    fi
+
+    # 3. A fresh results-audience token; the server takes it once for logs.
+    if ! oidc_config "$results_audience" "$secret/logs.curl"; then
+        return 1
+    fi
+    if ! ci-post -z "$api/api/ci/logs" "$secret/logs.curl" "$state/logs-response.json" "$body"; then
+        rm -f "$secret/logs.curl"
+        return 1
+    fi
+    rm -f "$secret/logs.curl"
 }
 
 on_error() {
@@ -496,6 +628,7 @@ exchange_token() {
         def shell_text: type == "string" and length > 0 and all(explode[]; . != 0);
         def commands: type == "array" and all(.[]; shell_text);
         def optional(check): . == null or check;
+        def proxied: [.features | objects | .git_proxy == true] | any;
         def laravel_block:
             (.dir == "." or (.dir | relative_path))
             and (.setup | commands)
@@ -526,6 +659,9 @@ exchange_token() {
             (if (.stack | IN("laravel", "flutter")) and ((.role | tostring | startswith("flutter-")) == (.stack == "flutter"))
                 then empty else "stack" end),
             (if (.cache_namespace | type == "string" and test("^[0-9a-f]{16}$")) then empty else "cache_namespace" end),
+            (if (.features | optional(type == "object" and all(.[]; type == "boolean"))) then empty else "features" end),
+            (if (proxied | not) or (.git_ticket | type == "string" and test("^v1\\.[A-Za-z0-9_-]+\\.[0-9a-f]{64}$"))
+                then empty else "git_ticket" end),
             (if (try (
                 (.manifest | type == "object")
                 and .manifest.version == 1
@@ -547,6 +683,25 @@ exchange_token() {
         "header = \"Accept: application/vnd.github+json\"",
         "header = \"X-GitHub-Api-Version: 2022-11-28\""
     ' "$secret/token.json" >"$secret/github.curl"
+
+    # Owner rows send no features, which keeps both off.
+    git_proxy="$(jq -r '.features.git_proxy == true' "$secret/token.json")"
+    log_upload="$(jq -r '.features.log_upload == true' "$secret/token.json")"
+
+    if [ "$git_proxy" = true ]; then
+        jq -j '.git_ticket' "$secret/token.json" >"$secret/git-ticket"
+        jq -r '"header = \"X-Ci-Ticket: \(.git_ticket)\""' "$secret/token.json" >>"$secret/github.curl"
+    fi
+
+    # What upload_logs replaces; written now because run, a later step,
+    # never sees the token response.
+    if [ "$log_upload" = true ]; then
+        {
+            jq -r '.token, (.git_ticket // empty), .cache_namespace' "$secret/token.json"
+            basic_auth
+            echo
+        } >"$secret/redact"
+    fi
 
     # The stack's manifest block is all run needs of the manifest; it stays
     # root-only beside the logs.
@@ -575,30 +730,54 @@ exchange_token() {
     fi
 
     # The URL is written by printf, a builtin, so the repository name never
-    # becomes an argument of a git command.
+    # becomes an argument of a git command. Through the Worker the URL names
+    # no repository at all: the ticket does.
     git init --quiet "$tree"
-    printf '[remote "origin"]\n\turl = https://github.com/%s.git\n' "$repository" >>"$tree/.git/config"
+    if [ "$git_proxy" = true ]; then
+        printf '[remote "origin"]\n\turl = %s/git\n' "$api" >>"$tree/.git/config"
+    else
+        printf '[remote "origin"]\n\turl = https://github.com/%s.git\n' "$repository" >>"$tree/.git/config"
+    fi
+}
+
+# The installation token as the Basic credential GitHub's git endpoint takes.
+basic_auth() {
+    printf 'x-access-token:%s' "$(cat "$secret/github-token")" | base64 | tr -d '\n'
 }
 
 # git asks GIT_ASKPASS for the password; the helper reads the token from the
 # 0600 file named in its environment, and credential.helper is emptied so no
-# helper stores it.
+# helper stores it. Through the Worker the ticket and the Basic credential are
+# http.extraHeader values in git's environment instead, which no other account
+# can read and which never reach argv or the remote URL.
 git_with_token() {
-    GIT_ASKPASS="$secret/askpass" \
-        CI_GIT_TOKEN_FILE="$secret/github-token" \
-        GIT_TERMINAL_PROMPT=0 \
-        git -C "$tree" -c credential.helper= "$@"
+    if [ "$git_proxy" = true ]; then
+        GIT_CONFIG_COUNT=2 \
+            GIT_CONFIG_KEY_0=http.extraHeader \
+            GIT_CONFIG_VALUE_0="X-Ci-Ticket: $(cat "$secret/git-ticket")" \
+            GIT_CONFIG_KEY_1=http.extraHeader \
+            GIT_CONFIG_VALUE_1="Authorization: Basic $(basic_auth)" \
+            GIT_TERMINAL_PROMPT=0 \
+            git -C "$tree" -c credential.helper= "$@"
+    else
+        GIT_ASKPASS="$secret/askpass" \
+            CI_GIT_TOKEN_FILE="$secret/github-token" \
+            GIT_TERMINAL_PROMPT=0 \
+            git -C "$tree" -c credential.helper= "$@"
+    fi
 }
 
 fetch_source() {
-    cat >"$secret/askpass" <<'SH'
+    if [ "$git_proxy" != true ]; then
+        cat >"$secret/askpass" <<'SH'
 #!/bin/sh
 case "$1" in
     Username*) echo x-access-token ;;
     *) cat "$CI_GIT_TOKEN_FILE" ;;
 esac
 SH
-    chmod 0700 "$secret/askpass"
+        chmod 0700 "$secret/askpass"
+    fi
 
     if ! git_with_token fetch --quiet --no-tags --depth=1 origin "$head_sha"; then
         say 'fetching the head commit failed'
@@ -782,6 +961,7 @@ prepare() {
         --arg php "$php" \
         --arg filter "$filter" \
         --arg pint_base "$pint_base" \
+        --argjson log_upload "$log_upload" \
         '{
             mode: $mode,
             role: $role,
@@ -793,7 +973,7 @@ prepare() {
             php: $php,
             filter: $filter,
             pint_base: $pint_base,
-        }' \
+        } + (if $log_upload then {log_upload: true} else {} end)' \
         >"$state/job.json"
 
     # 5. actions/cache needs the namespace for the key, and logs the key it
@@ -1013,18 +1193,32 @@ run_flutter_warm() {
     fi
 }
 
+# Prints the manifest's test command, or the default. Both expand inside the
+# sandbox, from the CI_* environment. An override that runs `flutter test`
+# without --file-reporter leaves collect_report nothing to read (every count
+# 0, no test name), so the JSON reporter goes in right after `flutter test`.
+flutter_test_command() {
+    local command
+    local reporter='--file-reporter "json:$CI_REPORT_DIR/flutter.json"'
+
+    command="$(jq -r '.test.command // empty' "$state/stack.json")"
+    if [ -z "$command" ]; then
+        cat <<'SH'
+flutter test --total-shards "$CI_SHARDS" --shard-index "$((CI_SHARD - 1))" --file-reporter "json:$CI_REPORT_DIR/flutter.json"
+SH
+        return 0
+    fi
+
+    if [[ "$command" == *'flutter test'* ]] && [[ "$command" != *--file-reporter* ]]; then
+        command="${command/flutter test/flutter test $reporter}"
+    fi
+    printf '%s\n' "$command"
+}
+
 run_flutter_test() {
     local command
 
-    # The default expands inside the sandbox, from the CI_* environment.
-    command="$(jq -r '.test.command // empty' "$state/stack.json")"
-    if [ -z "$command" ]; then
-        command="$(
-            cat <<'SH'
-flutter test --total-shards "$CI_SHARDS" --shard-index "$((CI_SHARD - 1))" --file-reporter "json:$CI_REPORT_DIR/flutter.json"
-SH
-        )"
-    fi
+    command="$(flutter_test_command)"
 
     say 'setup'
     if ! run_commands setup setup; then
@@ -1060,6 +1254,7 @@ run() {
     php="$(jq -r '.php' "$state/job.json")"
     filter="$(jq -r '.filter' "$state/job.json")"
     pint_base="$(jq -r '.pint_base' "$state/job.json")"
+    log_upload="$(jq -r '.log_upload // false' "$state/job.json")"
     dir="$(jq -r '.dir' "$state/stack.json")"
 
     # 1. The cache was restored by root; -h keeps a planted symlink from
