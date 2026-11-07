@@ -18,9 +18,9 @@ permissions:
 
 jobs:
   build:
-    # Copies of this repository never publish unless the repository variable CI_PUBLISH is `true`:
-    # the registry namespace is the owner's, and a neutral org repository opts in by setting it.
-    if: contains(fromJSON('["kodizm/kodizm-ci"]'), github.repository) || vars.CI_PUBLISH == 'true'
+    # A repository publishes only when its repository variable CI_PUBLISH is `true`, so a copy never
+    # pushes into a registry namespace by accident: each publishing repository opts in by setting it.
+    if: vars.CI_PUBLISH == 'true'
     name: build (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -75,7 +75,7 @@ jobs:
 
   promote:
     needs: build
-    if: (contains(fromJSON('["kodizm/kodizm-ci"]'), github.repository) || vars.CI_PUBLISH == 'true') && github.ref == 'refs/heads/main'
+    if: vars.CI_PUBLISH == 'true' && github.ref == 'refs/heads/main'
     name: promote (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
